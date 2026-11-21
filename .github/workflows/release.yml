@@ -1,0 +1,90 @@
+name: Release to PyPI
+
+# Runs in the PUBLIC mirror (github.com/JoboAI/langchain-jobo), where this file
+# lands via the monorepo's connectors-mirror workflow. It does nothing in the
+# monorepo, where it sits under Jobo.Connectors/langchain/.
+#
+# Cut a GitHub release (tag vX.Y.Z) in the mirror to publish. There is no token
+# or secret: the publish job authenticates with PyPI trusted publishing (OIDC).
+# One-time setup on PyPI, signed in as the account that owns the project
+# (https://pypi.org/manage/account/publishing/): add a publisher with
+#   owner JoboAI · repository langchain-jobo · workflow release.yml · environment pypi
+# Before the first upload that is a "pending publisher"; the first release
+# creates the project and claims the name.
+#
+# Publishing from the public mirror, not the private monorepo, is what lets
+# PyPI show the repository link as verified.
+on:
+  release:
+    types: [published]
+  # Rehearsal: installs, tests, builds and checks the distributions. Never publishes.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The committed version is the source of truth, not the tag. A PyPI
+      # version can never be reused, so a mismatch stops here. Bump
+      # langchain_jobo/_version.py in the monorepo, wait for the mirror sync,
+      # THEN cut the release.
+      - name: Check the release tag matches the package version
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CURRENT="$(python -c "import re, pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('langchain_jobo/_version.py').read_text()).group(1))")"
+          if [ "$CURRENT" != "$TAG_VERSION" ]; then
+            echo "::error::tag v$TAG_VERSION does not match langchain_jobo/_version.py ($CURRENT). Bump the version in the monorepo, wait for the mirror sync, then re-cut the release."
+            exit 1
+          fi
+          echo "langchain_jobo is at $TAG_VERSION"
+
+      # --group needs pip 25.1 or later.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . --group test
+
+      # Sockets are disabled by pytest-socket; nothing here reaches the API.
+      - name: Test
+        run: pytest
+
+      - name: Build and check the distributions
+        run: |
+          python -m pip install build twine
+          python -m build
+          twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    # Must match the environment named in the PyPI trusted publisher.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/langchain-jobo/
+    permissions:
+      id-token: write # PyPI trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
