@@ -1,7 +1,9 @@
-"""The HTTP layer: headers, retry policy and error mapping."""
+"""The HTTP layer: the key, headers, connections, retries and error mapping."""
 
 from __future__ import annotations
 
+import asyncio
+import copy
 from typing import Any
 
 import httpx
@@ -11,6 +13,7 @@ from pydantic import SecretStr
 from langchain_jobo import (
     JoboAPIError,
     JoboAuthenticationError,
+    JoboConfigurationError,
     JoboConflictError,
     JoboConnectionError,
     JoboError,
@@ -23,12 +26,19 @@ from langchain_jobo import (
     JoboValidationError,
     __version__,
 )
-from langchain_jobo._client import JoboClient
+from langchain_jobo._client import (
+    JoboClient,
+    is_sandbox_key,
+    require_live_key,
+    resolve_api_key,
+)
 from tests.unit_tests.helpers import (
     CURSOR_RESTART,
     INSUFFICIENT_CREDITS,
     RATE_LIMITED,
+    SANDBOX_KEY,
     TEST_KEY,
+    VALIDATION_PROBLEM,
     Handler,
     MockJobo,
     reply,
@@ -94,10 +104,44 @@ def test_timeout_is_passed_per_request() -> None:
     assert api.requests[1].extensions["timeout"]["read"] == 120.0
 
 
-@pytest.mark.parametrize("key", ["", "   "])
-def test_blank_api_key_is_rejected(key: str) -> None:
-    with pytest.raises(ValueError, match="JOBO_API_KEY"):
+@pytest.mark.parametrize("key", ["", "   ", SecretStr(" ")])
+def test_blank_api_key_is_rejected_with_where_to_get_one(key: str | SecretStr) -> None:
+    with pytest.raises(JoboConfigurationError, match="JOBO_API_KEY") as caught:
         JoboClient(key)
+
+    assert "https://enterprise.jobo.world/api-keys" in str(caught.value)
+    assert isinstance(caught.value, JoboError)
+
+
+def test_missing_key_is_read_from_the_environment_or_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(JoboConfigurationError, match="JOBO_API_KEY"):
+        resolve_api_key(None)
+
+    monkeypatch.setenv("JOBO_API_KEY", "  jbe_live_from-env\n")
+
+    assert resolve_api_key(None).get_secret_value() == "jbe_live_from-env"
+
+
+def test_key_is_trimmed_before_it_is_sent() -> None:
+    api = MockJobo(ok)
+    client = JoboClient(f"  {TEST_KEY}\n", http_client=api.client)
+
+    client.request("GET", "/x")
+
+    assert api.last.headers["X-Api-Key"] == TEST_KEY
+
+
+def test_sandbox_keys_are_told_apart_by_their_prefix() -> None:
+    assert is_sandbox_key(SANDBOX_KEY)
+    assert is_sandbox_key(SecretStr(f" {SANDBOX_KEY}"))
+    assert not is_sandbox_key(TEST_KEY)
+    assert not is_sandbox_key("jbe_legacy-key")
+
+    require_live_key(TEST_KEY, "JoboFeedLoader", "the job feed")
+    with pytest.raises(JoboConfigurationError, match="JoboFeedLoader needs a live"):
+        require_live_key(SANDBOX_KEY, "JoboFeedLoader", "the job feed")
 
 
 def test_api_key_is_never_exposed() -> None:
@@ -228,6 +272,87 @@ def test_409_cursor_restart_exposes_the_replacement_request() -> None:
     assert isinstance(caught.value, JoboConflictError)
     assert len(api.requests) == 1
     assert sleeps == []
+
+
+def test_400_folds_the_field_errors_into_the_message() -> None:
+    """Without them the message is only "One or more validation errors occurred."."""
+    client, api, _ = build(reply(400, VALIDATION_PROBLEM))
+
+    with pytest.raises(JoboValidationError) as caught:
+        client.request("POST", "/api/jobs/feed", json={})
+
+    assert str(caught.value) == (
+        "Jobo API error 400: One or more validation errors occurred. "
+        "page_size: page_size must be between 1 and 100; "
+        "locations[0].country: country is required when city or region is set "
+        '(a name or ISO code, e.g. "United States" or "US").'
+    )
+    assert caught.value.errors == VALIDATION_PROBLEM["errors"]
+    assert caught.value.detail == "One or more validation errors occurred."
+    assert len(api.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"title": "Invalid cursor", "code": "invalid_cursor"},
+        {"title": "Bad", "errors": None},
+        {"title": "Bad", "errors": {"page": []}},
+        {"title": "Bad", "errors": ["not", "a", "map"]},
+        "plain text",
+    ],
+)
+def test_400_without_field_errors_has_an_empty_errors_map(body: Any) -> None:
+    handler = reply(400, text=body) if isinstance(body, str) else reply(400, body)
+    client, _, _ = build(handler)
+
+    with pytest.raises(JoboValidationError) as caught:
+        client.request("POST", "/api/jobs/feed", json={})
+
+    assert caught.value.errors == {}
+    assert str(caught.value).startswith("Jobo API error 400")
+
+
+def test_400_field_errors_given_as_a_single_string_are_kept() -> None:
+    client, _, _ = build(reply(400, {"title": "Bad", "errors": {"cursor": "stale"}}))
+
+    with pytest.raises(JoboValidationError) as caught:
+        client.request("POST", "/api/jobs/feed", json={})
+
+    assert caught.value.errors == {"cursor": ["stale"]}
+    assert str(caught.value) == "Jobo API error 400: Bad. cursor: stale."
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({"Retry-After": "12"}, "Retry after 12 seconds."),
+        ({}, "Retry after 7 seconds."),  # `retry_after_seconds` in the body
+        ({"Retry-After": "0.5"}, "Retry after 0.5 seconds."),
+    ],
+)
+def test_429_message_says_how_long_to_wait(
+    headers: dict[str, str], expected: str
+) -> None:
+    client, _, _ = build(reply(429, RATE_LIMITED, headers=headers), max_retries=0)
+
+    with pytest.raises(JoboRateLimitError) as caught:
+        client.request("POST", "/api/jobs/search", json={})
+
+    assert str(caught.value) == (
+        "Jobo API error 429 (rate_limit_exceeded): Per-minute JobSearch request "
+        f"limit of 60 exceeded. Try again shortly. {expected}"
+    )
+
+
+def test_429_without_a_wait_does_not_invent_one() -> None:
+    client, _, _ = build(reply(429, {"error": "Too many requests"}), max_retries=0)
+
+    with pytest.raises(JoboRateLimitError) as caught:
+        client.request("GET", "/x")
+
+    assert caught.value.retry_after is None
+    assert str(caught.value) == "Jobo API error 429: Too many requests"
 
 
 def test_429_honours_retry_after_header_then_succeeds() -> None:
@@ -407,3 +532,165 @@ async def test_async_500_gives_up_after_max_retries() -> None:
 
     assert sleeps == [1.0, 2.0]
     assert len(api.requests) == 3
+
+
+# ---------------------------------------------------------------- connections
+
+
+class CountingClients:
+    """Stands in for `httpx.Client` / `httpx.AsyncClient`, counting what is made."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.sync: list[httpx.Client] = []
+        self.asynchronous: list[httpx.AsyncClient] = []
+        real_sync, real_async = httpx.Client, httpx.AsyncClient
+
+        def make_sync() -> httpx.Client:
+            self.sync.append(real_sync(transport=httpx.MockTransport(ok)))
+            return self.sync[-1]
+
+        def make_async() -> httpx.AsyncClient:
+            self.asynchronous.append(real_async(transport=httpx.MockTransport(ok)))
+            return self.asynchronous[-1]
+
+        monkeypatch.setattr(httpx, "Client", make_sync)
+        monkeypatch.setattr(httpx, "AsyncClient", make_async)
+
+
+@pytest.fixture
+def made(monkeypatch: pytest.MonkeyPatch) -> CountingClients:
+    return CountingClients(monkeypatch)
+
+
+def test_sync_requests_reuse_one_connection_pool(made: CountingClients) -> None:
+    client = JoboClient(TEST_KEY)
+
+    for _ in range(3):
+        assert client.request("GET", "/x").data == {"ok": True}
+
+    assert len(made.sync) == 1
+    assert not made.sync[0].is_closed
+
+
+def test_close_closes_the_pool_and_the_client_stays_usable(
+    made: CountingClients,
+) -> None:
+    client = JoboClient(TEST_KEY)
+    client.request("GET", "/x")
+
+    client.close()
+    client.close()  # closing twice is harmless
+
+    assert made.sync[0].is_closed
+    assert client.request("GET", "/x").data == {"ok": True}
+    assert len(made.sync) == 2
+
+
+def test_client_is_a_context_manager(made: CountingClients) -> None:
+    with JoboClient(TEST_KEY) as client:
+        client.request("GET", "/x")
+
+    assert made.sync[0].is_closed
+
+
+def test_a_client_that_was_passed_in_is_never_closed() -> None:
+    api = MockJobo(ok)
+
+    with JoboClient(TEST_KEY, http_client=api.client) as client:
+        client.request("GET", "/x")
+
+    assert not api.client.is_closed
+
+
+async def test_async_requests_reuse_one_connection_pool(
+    made: CountingClients,
+) -> None:
+    client = JoboClient(TEST_KEY)
+
+    for _ in range(3):
+        assert (await client.arequest("GET", "/x")).data == {"ok": True}
+
+    assert len(made.asynchronous) == 1
+    assert made.sync == []
+
+
+async def test_aclose_closes_the_async_and_the_sync_pool(
+    made: CountingClients,
+) -> None:
+    client = JoboClient(TEST_KEY)
+    await client.arequest("GET", "/x")
+    client.request("GET", "/x")
+
+    await client.aclose()
+    await client.aclose()
+
+    assert made.asynchronous[0].is_closed
+    assert made.sync[0].is_closed
+    assert (await client.arequest("GET", "/x")).data == {"ok": True}
+    assert len(made.asynchronous) == 2
+
+
+async def test_client_is_an_async_context_manager(made: CountingClients) -> None:
+    async with JoboClient(TEST_KEY) as client:
+        await client.arequest("GET", "/x")
+
+    assert made.asynchronous[0].is_closed
+
+
+async def test_an_async_client_that_was_passed_in_is_never_closed() -> None:
+    api = MockJobo(ok)
+
+    async with JoboClient(TEST_KEY, http_async_client=api.async_client) as client:
+        await client.arequest("GET", "/x")
+
+    assert not api.async_client.is_closed
+
+
+def test_each_event_loop_gets_its_own_async_client(made: CountingClients) -> None:
+    """An `httpx.AsyncClient` cannot be shared between event loops."""
+    client = JoboClient(TEST_KEY)
+
+    async def twice() -> None:
+        await client.arequest("GET", "/x")
+        await client.arequest("GET", "/x")
+
+    asyncio.run(twice())
+    asyncio.run(twice())
+
+    assert len(made.asynchronous) == 2
+
+
+def test_clients_of_closed_event_loops_are_let_go(made: CountingClients) -> None:
+    """A long-lived component called through `asyncio.run()` must not grow."""
+    client = JoboClient(TEST_KEY)
+
+    for _ in range(5):
+        asyncio.run(client.arequest("GET", "/x"))
+
+    assert len(made.asynchronous) == 5
+    assert len(client._owned_async_clients) == 1
+
+
+def test_a_deep_copy_keeps_the_settings_and_opens_its_own_connections(
+    made: CountingClients,
+) -> None:
+    client = JoboClient(TEST_KEY, base_url="https://example.test", max_retries=0)
+    client.request("GET", "/x")
+
+    twin = copy.deepcopy(client)
+    twin.request("GET", "/x")
+
+    assert twin.base_url == "https://example.test"
+    assert twin.max_retries == 0
+    assert len(made.sync) == 2
+    client.close()
+    assert not made.sync[1].is_closed
+
+
+def test_a_deep_copy_shares_a_client_that_was_passed_in() -> None:
+    api = MockJobo(ok)
+    client = JoboClient(TEST_KEY, http_client=api.client)
+
+    copy.deepcopy(client).request("GET", "/x")
+
+    assert api.last.headers["X-Api-Key"] == TEST_KEY

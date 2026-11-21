@@ -20,7 +20,9 @@ from langchain_tests.unit_tests import ToolsUnitTests
 
 from langchain_jobo import (
     JoboCompanySearchTool,
+    JoboFilterValuesTool,
     JoboJobDetailsTool,
+    JoboLocationSearchTool,
     JoboRetriever,
     JoboSearchTool,
 )
@@ -48,12 +50,34 @@ SUGGESTIONS = {
 }
 
 
+FILTER_OPTIONS = {
+    "facet": "industries",
+    "options": [{"key": "Software Development", "count": 120431}],
+}
+
+PLACES = {
+    "suggestions": [
+        {
+            "city": "Berlin",
+            "region": "Berlin",
+            "country": "Germany",
+            "display_name": "Berlin, Germany",
+            "country_code": "DE",
+        }
+    ]
+}
+
+
 def _handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     if path == "/api/jobs/search":
         return search_handler(request)
     if path == "/api/connectors/companies/suggest":
         return httpx.Response(200, json=SUGGESTIONS)
+    if path == "/api/connectors/locations/suggest":
+        return httpx.Response(200, json=PLACES)
+    if path.startswith("/api/connectors/filter-options/"):
+        return httpx.Response(200, json=FILTER_OPTIONS)
     if path.startswith("/api/jobs/"):
         return httpx.Response(200, json=make_job(1))
     return httpx.Response(404, json={"title": "Not Found"})
@@ -162,6 +186,70 @@ class TestJoboCompanySearchToolMocked(ToolsIntegrationTests):
     @property
     def tool_invoke_params_example(self) -> dict[str, Any]:
         return {"query": "stripe", "limit": 3}
+
+
+class TestJoboFilterValuesToolUnit(ToolsUnitTests):
+    @property
+    def tool_constructor(self) -> type[BaseTool]:
+        return JoboFilterValuesTool
+
+    @property
+    def tool_constructor_params(self) -> dict[str, Any]:
+        return {"api_key": TEST_KEY}
+
+    @property
+    def tool_invoke_params_example(self) -> dict[str, Any]:
+        return {"facet": "industries", "query": "soft", "limit": 3}
+
+    @property
+    def init_from_env_params(self) -> EnvParams:
+        return ENV_PARAMS
+
+
+class TestJoboFilterValuesToolMocked(ToolsIntegrationTests):
+    @property
+    def tool_constructor(self) -> type[BaseTool]:
+        return JoboFilterValuesTool
+
+    @property
+    def tool_constructor_params(self) -> dict[str, Any]:
+        return _mocked()
+
+    @property
+    def tool_invoke_params_example(self) -> dict[str, Any]:
+        return {"facet": "industries", "query": "soft", "limit": 3}
+
+
+class TestJoboLocationSearchToolUnit(ToolsUnitTests):
+    @property
+    def tool_constructor(self) -> type[BaseTool]:
+        return JoboLocationSearchTool
+
+    @property
+    def tool_constructor_params(self) -> dict[str, Any]:
+        return {"api_key": TEST_KEY}
+
+    @property
+    def tool_invoke_params_example(self) -> dict[str, Any]:
+        return {"query": "berlin", "limit": 3}
+
+    @property
+    def init_from_env_params(self) -> EnvParams:
+        return ENV_PARAMS
+
+
+class TestJoboLocationSearchToolMocked(ToolsIntegrationTests):
+    @property
+    def tool_constructor(self) -> type[BaseTool]:
+        return JoboLocationSearchTool
+
+    @property
+    def tool_constructor_params(self) -> dict[str, Any]:
+        return _mocked()
+
+    @property
+    def tool_invoke_params_example(self) -> dict[str, Any]:
+        return {"query": "berlin", "limit": 3}
 
 
 class TestJoboRetrieverMocked(RetrieversIntegrationTests):

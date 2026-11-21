@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -11,19 +13,26 @@ from langchain_core.documents import Document
 from pydantic import ValidationError
 
 from langchain_jobo import (
+    FeedLocation,
+    IncludeExclude,
+    JoboConfigurationError,
     JoboFeedCursorRestartRequiredError,
     JoboFeedFilters,
     JoboFeedLoader,
     JoboInsufficientCreditsError,
     JoboNotFoundError,
+    JoboValidationError,
 )
 from langchain_jobo.document_loaders import _plan_batch_size
 from tests.unit_tests.helpers import (
     CURSOR_RESTART,
     INSUFFICIENT_CREDITS,
+    NOT_IN_SANDBOX,
+    SANDBOX_KEY,
     TEST_KEY,
     MockJobo,
     make_job,
+    reply,
 )
 
 
@@ -220,8 +229,13 @@ def test_filters_accept_a_model_and_reject_unknown_keys() -> None:
     ).load()
 
     assert api.bodies == [{"company_is_agency": False, "batch_size": 1}]
+    # The search spelling, not the feed's. A type checker rejects it as well.
     with pytest.raises(ValidationError):
-        JoboFeedLoader(api_key=TEST_KEY, max_jobs=1, filters={"work_model": ["remote"]})
+        JoboFeedLoader(
+            api_key=TEST_KEY,
+            max_jobs=1,
+            filters={"work_model": ["remote"]},  # type: ignore[arg-type]
+        )
 
 
 def test_feed_requests_use_the_long_timeout_and_identify_the_client() -> None:
@@ -242,9 +256,67 @@ def test_api_key_is_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -
     assert api.last.headers["X-Api-Key"] == "jbe_live_from-env"
 
 
-def test_missing_api_key_is_a_clear_error() -> None:
-    with pytest.raises(ValueError, match="JOBO_API_KEY"):
+def test_missing_api_key_is_a_clear_error_when_the_loader_is_built() -> None:
+    with pytest.raises(JoboConfigurationError, match="JOBO_API_KEY") as caught:
         JoboFeedLoader(max_jobs=1)
+
+    assert "https://enterprise.jobo.world/api-keys" in str(caught.value)
+
+
+@pytest.mark.parametrize("key", ["", "   "])
+def test_blank_api_key_is_refused_when_the_loader_is_built(key: str) -> None:
+    with pytest.raises(JoboConfigurationError, match="JOBO_API_KEY"):
+        JoboFeedLoader(max_jobs=1, api_key=key)
+
+
+def test_sandbox_key_is_refused_when_the_loader_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sandbox does not serve the feed: say so before any request."""
+    api = feed(total=1)
+
+    with pytest.raises(JoboConfigurationError) as caught:
+        JoboFeedLoader(max_jobs=1, api_key=SANDBOX_KEY, http_client=api.client)
+
+    assert str(caught.value).startswith("JoboFeedLoader needs a live API key")
+    assert "not the job feed" in str(caught.value)
+    assert SANDBOX_KEY not in str(caught.value)
+    assert api.requests == []
+
+    monkeypatch.setenv("JOBO_API_KEY", SANDBOX_KEY)
+    with pytest.raises(JoboConfigurationError, match="needs a live API key"):
+        JoboFeedLoader(max_jobs=1)
+
+
+def test_filters_take_the_typed_models() -> None:
+    api = feed(total=1)
+    JoboFeedLoader(
+        max_jobs=1,
+        filters=JoboFeedFilters(
+            locations=[FeedLocation(country="United States", region="Ohio")],
+            job_categories=IncludeExclude(include=["Healthcare"]),
+        ),
+        **api.kwargs,
+    ).load()
+
+    assert api.bodies == [
+        {
+            "locations": [{"country": "United States", "region": "Ohio"}],
+            "job_categories": {"include": ["Healthcare"]},
+            "batch_size": 1,
+        }
+    ]
+
+
+def test_a_city_without_a_country_is_refused_before_any_request() -> None:
+    api = feed(total=1)
+
+    with pytest.raises(ValidationError, match="country is required"):
+        JoboFeedLoader(
+            max_jobs=1, filters={"locations": [{"city": "Columbus"}]}, **api.kwargs
+        )
+
+    assert api.requests == []
 
 
 # ------------------------------------------------------------------ documents
@@ -262,8 +334,9 @@ def test_documents_are_rendered_jobs() -> None:
     assert documents[0].id == "00000000-0000-4000-8000-000000000000"
     assert documents[0].page_content.startswith("# Senior Backend Engineer 0")
     assert "## Description" in documents[0].page_content
-    assert documents[0].metadata["source"] == "greenhouse"
+    assert documents[0].metadata["source"] == "https://jobs.acme.example/0"
     assert documents[0].metadata["url"] == "https://jobs.acme.example/0"
+    assert documents[0].metadata["ats"] == "greenhouse"
 
 
 def test_description_can_be_left_out() -> None:
@@ -373,7 +446,9 @@ def test_blank_cursor_means_start_from_the_beginning() -> None:
     assert api.bodies == [{"batch_size": 1}]
 
 
-def test_warnings_from_the_first_page_are_kept() -> None:
+def test_warnings_from_the_first_page_are_kept_and_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     warning = {
         "code": "companies_unmatched",
         "field": "companies.include",
@@ -389,9 +464,12 @@ def test_warnings_from_the_first_page_are_kept() -> None:
     api = MockJobo(lambda _: httpx.Response(200, json=page))
     loader = JoboFeedLoader(max_jobs=10, filters={"companies": ["Acme"]}, **api.kwargs)
 
-    assert loader.load() == []
+    with caplog.at_level(logging.WARNING, logger="langchain_jobo"):
+        assert loader.load() == []
+
     assert api.bodies == [{"companies": {"include": ["Acme"]}, "batch_size": 10}]
     assert loader.warnings == [warning]
+    assert caplog.messages == ["Jobo feed: No company matched: Acme."]
     assert loader.estimated_total == 0
     assert loader.jobs_billed == 0
 
@@ -465,18 +543,14 @@ def test_503_is_retried_with_the_same_cursor() -> None:
     assert api.bodies == [{"batch_size": 2}, {"cursor": "2:2"}, {"cursor": "2:2"}]
 
 
-def test_sandbox_keys_get_a_typed_not_found() -> None:
-    problem = {
-        "title": "Not available in the sandbox",
-        "status": 404,
-        "code": "not_available_in_sandbox",
-    }
-    api = MockJobo(lambda _: httpx.Response(404, json=problem))
+def test_a_sandbox_refusal_from_the_api_is_a_typed_not_found() -> None:
+    api = MockJobo(reply(404, NOT_IN_SANDBOX))
 
     with pytest.raises(JoboNotFoundError) as caught:
         JoboFeedLoader(max_jobs=1, **api.kwargs).load()
 
     assert caught.value.code == "not_available_in_sandbox"
+    assert caught.value.not_available_in_sandbox is True
 
 
 # ---------------------------------------------------------------------- async
@@ -523,3 +597,177 @@ async def test_async_resume_and_errors() -> None:
     with pytest.raises(JoboFeedCursorRestartRequiredError):
         await JoboFeedLoader(max_jobs=2, cursor="stale", **failing.kwargs).aload()
     assert len(failing.requests) == 1
+
+
+# --------------------------------------------------------------- expired jobs
+
+
+class FakeExpired:
+    """`GET /api/jobs/expired` over `total` ids. The cursor is the next offset."""
+
+    def __init__(self, total: int) -> None:
+        self.total = total
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        size = int(params.get("batch_size", "1000"))
+        offset = int(params.get("cursor", "0"))
+        ids = [f"expired-{i}" for i in range(offset, min(offset + size, self.total))]
+        has_more = offset + len(ids) < self.total
+        return httpx.Response(
+            200,
+            json={
+                "job_ids": ids,
+                "next_cursor": str(offset + len(ids)) if has_more else None,
+                "has_more": has_more,
+            },
+        )
+
+
+def test_expired_job_ids_follow_the_cursor_to_the_end() -> None:
+    api = MockJobo(FakeExpired(total=5))
+    loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
+
+    ids = loader.expired_job_ids(batch_size=2)
+
+    assert ids == [f"expired-{i}" for i in range(5)]
+    assert [request.method for request in api.requests] == ["GET"] * 3
+    assert {request.url.path for request in api.requests} == {"/api/jobs/expired"}
+    assert [dict(request.url.params) for request in api.requests] == [
+        {"batch_size": "2"},
+        {"batch_size": "2", "cursor": "2"},
+        {"batch_size": "2", "cursor": "4"},
+    ]
+    assert api.last.extensions["timeout"]["read"] == 120.0
+    # The budget is for the billed feed: this endpoint is free, and unbounded.
+    assert loader.jobs_loaded == 0
+
+
+def test_expired_since_is_sent_as_utc() -> None:
+    api = MockJobo(FakeExpired(total=1))
+    loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
+    plus_two = timezone(timedelta(hours=2))
+
+    loader.expired_job_ids(datetime(2026, 11, 20, 8, 0, 0))
+    loader.expired_job_ids(expired_since=datetime(2026, 11, 20, 8, 0, tzinfo=plus_two))
+
+    assert [request.url.params["expired_since"] for request in api.requests] == [
+        "2026-11-20T08:00:00Z",
+        "2026-11-20T08:00:00+02:00",
+    ]
+    assert api.requests[0].url.params["batch_size"] == "1000"
+
+
+def test_expired_job_ids_are_lazy() -> None:
+    api = MockJobo(FakeExpired(total=10))
+    loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
+
+    iterator = loader.lazy_expired_job_ids(batch_size=2)
+
+    assert api.requests == []
+    assert [next(iterator), next(iterator)] == ["expired-0", "expired-1"]
+    assert len(api.requests) == 1
+
+
+def test_no_expired_jobs_is_an_empty_list() -> None:
+    api = MockJobo(FakeExpired(total=0))
+
+    assert JoboFeedLoader(max_jobs=1, **api.kwargs).expired_job_ids() == []
+    assert len(api.requests) == 1
+
+
+@pytest.mark.parametrize("batch_size", [0, 10_001, True])
+def test_expired_batch_size_is_bounded_by_the_api(batch_size: Any) -> None:
+    api = MockJobo(FakeExpired(total=1))
+    loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
+
+    with pytest.raises(ValueError, match="batch_size must be between 1 and 10000"):
+        loader.expired_job_ids(batch_size=batch_size)
+
+    assert api.requests == []
+
+
+def test_expired_since_too_far_back_is_the_apis_typed_error() -> None:
+    problem = {
+        "title": "Invalid expired_since",
+        "status": 400,
+        "detail": "expired_since cannot be more than 7 days in the past.",
+    }
+    api = MockJobo(reply(400, problem))
+    loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
+
+    with pytest.raises(JoboValidationError, match="more than 7 days in the past"):
+        loader.expired_job_ids(datetime(2020, 1, 1))
+
+
+def test_an_expired_cursor_that_stops_advancing_does_not_loop_forever() -> None:
+    stuck = {"job_ids": ["a"], "next_cursor": "same", "has_more": True}
+    api = MockJobo(reply(200, stuck))
+    loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
+
+    assert loader.expired_job_ids() == ["a", "a"]
+    assert len(api.requests) == 2
+
+
+async def test_expired_job_ids_async() -> None:
+    api = MockJobo(FakeExpired(total=5))
+    loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
+
+    ids = await loader.aexpired_job_ids(datetime(2026, 11, 20), batch_size=2)
+    lazily = [job_id async for job_id in loader.alazy_expired_job_ids(batch_size=5)]
+
+    assert ids == lazily == [f"expired-{i}" for i in range(5)]
+    assert dict(api.requests[1].url.params) == {
+        "batch_size": "2",
+        "expired_since": "2026-11-20T00:00:00Z",
+        "cursor": "2",
+    }
+    assert len(api.requests) == 4
+    with pytest.raises(ValueError, match="batch_size"):
+        await loader.aexpired_job_ids(batch_size=0)
+
+
+# ---------------------------------------------------------------- connections
+
+
+def test_loader_is_a_context_manager_and_leaves_your_client_open() -> None:
+    api = feed(total=2)
+
+    with JoboFeedLoader(max_jobs=2, **api.kwargs) as loader:
+        assert len(loader.load()) == 2
+    loader.close()
+
+    assert isinstance(loader, JoboFeedLoader)
+    assert not api.client.is_closed
+
+
+def test_closing_the_loader_closes_the_connections_it_opened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    made: list[httpx.Client] = []
+    real = httpx.Client
+
+    def make() -> httpx.Client:
+        made.append(real(transport=httpx.MockTransport(FakeFeed(total=4))))
+        return made[-1]
+
+    monkeypatch.setattr(httpx, "Client", make)
+    loader = JoboFeedLoader(max_jobs=4, batch_size=2, api_key=TEST_KEY)
+
+    assert len(loader.load()) == 4
+    assert len(made) == 1  # both pages went over one connection pool
+    loader.close()
+
+    assert made[0].is_closed
+    assert len(loader.load()) == 4  # and the loader opens a new one when reused
+    assert len(made) == 2
+
+
+async def test_loader_is_an_async_context_manager() -> None:
+    api = feed(total=2)
+
+    async with JoboFeedLoader(max_jobs=2, **api.kwargs) as loader:
+        assert len(await loader.aload()) == 2
+    await loader.aclose()
+
+    assert not api.async_client.is_closed

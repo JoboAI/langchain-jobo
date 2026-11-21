@@ -11,7 +11,9 @@ import httpx
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
-TEST_KEY = "jbe_test_unit-test-key"
+#: A live-looking key: the feed loader refuses a sandbox one.
+TEST_KEY = "jbe_live_unit-test-key"
+SANDBOX_KEY = "jbe_test_unit-test-key"
 
 
 def make_job(index: int = 0, **overrides: Any) -> dict[str, Any]:
@@ -201,6 +203,42 @@ RATE_LIMITED = {
     "detail": "Per-minute JobSearch request limit of 60 exceeded. Try again shortly.",
     "group": "JobSearch",
     "retry_after_seconds": 7,
+}
+
+#: What a sandbox key gets from an endpoint the sandbox does not serve.
+NOT_IN_SANDBOX = {
+    "type": "https://tools.ietf.org/html/rfc9110#section-15.5.5",
+    "title": "Not available in the sandbox",
+    "status": 404,
+    "code": "not_available_in_sandbox",
+    "detail": (
+        "Sandbox keys (jbe_test_…) serve job search, job and company lookups, "
+        "Auto Apply applications, and reading mailboxes. Use a live key for "
+        "every other endpoint."
+    ),
+    "instance": "/api/connectors/companies/suggest",
+}
+
+#: `GET /api/jobs/{id}` for an id no job has. The API sends no `code` here.
+JOB_NOT_FOUND = {
+    "type": "https://tools.ietf.org/html/rfc9110#section-15.5.5",
+    "title": "Job not found",
+    "status": 404,
+    "detail": "No job exists with id '00000000-0000-4000-8000-000000000042'.",
+}
+
+#: An ASP.NET validation problem: the reasons are in `errors`, not `detail`.
+VALIDATION_PROBLEM = {
+    "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+    "title": "One or more validation errors occurred.",
+    "status": 400,
+    "errors": {
+        "page_size": ["page_size must be between 1 and 100."],
+        "locations[0].country": [
+            "country is required when city or region is set (a name or ISO "
+            'code, e.g. "United States" or "US").'
+        ],
+    },
 }
 
 CURSOR_RESTART = {

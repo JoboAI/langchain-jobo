@@ -9,13 +9,18 @@ import pytest
 from langchain_jobo.formatting import (
     format_company_suggestions,
     format_compensation,
+    format_filter_values,
     format_job_document,
     format_job_summary,
     format_location,
+    format_location_suggestions,
     format_occupation,
+    format_occupation_matches,
     format_search_results,
     job_metadata,
     job_to_document,
+    response_warnings,
+    warning_messages,
 )
 from tests.unit_tests.helpers import make_job, search_page
 
@@ -238,7 +243,7 @@ def test_job_document_is_self_contained_prose() -> None:
         "## Description\nWe are hiring a **backend engineer** to build the API.",
         "Listing: https://jobs.acme.example/3",
         "Apply: https://jobs.acme.example/3/apply",
-        "Source: greenhouse",
+        "ATS: greenhouse",
         "Job ID: 00000000-0000-4000-8000-000000000003",
     ):
         assert expected in text
@@ -285,7 +290,7 @@ def test_job_document_of_a_sparse_job_has_no_empty_sections() -> None:
         "Company: Haulage Ltd\n"
         "Location: Not stated\n\n"
         "Listing: https://example.test/driver\n"
-        "Source: workday\n"
+        "ATS: workday\n"
         "Job ID: abc"
     )
 
@@ -312,6 +317,7 @@ def test_job_document_lists_every_location_and_a_distinct_brand() -> None:
 def test_job_metadata_is_flat_and_complete() -> None:
     assert job_metadata(make_job(5)) == {
         "id": "00000000-0000-4000-8000-000000000005",
+        "source": "https://jobs.acme.example/5",
         "url": "https://jobs.acme.example/5",
         "apply_url": "https://jobs.acme.example/5/apply",
         "title": "Senior Backend Engineer 5",
@@ -329,8 +335,22 @@ def test_job_metadata_is_flat_and_complete() -> None:
         "date_posted": "2026-11-16T00:00:00Z",
         "created_at": "2026-11-17T08:00:00Z",
         "updated_at": "2026-11-18T09:30:00Z",
-        "source": "greenhouse",
+        "ats": "greenhouse",
     }
+
+
+def test_metadata_source_says_where_the_document_came_from() -> None:
+    """LangChain convention: `source` locates the document. The ATS is `ats`."""
+    listed = job_metadata(make_job(1))
+    apply_only = job_metadata(make_job(1, listing_url=None))
+    no_url = job_metadata(make_job(1, listing_url=None, apply_url=""))
+
+    assert listed["source"] == listed["url"] == "https://jobs.acme.example/1"
+    assert listed["ats"] == "greenhouse"
+    assert apply_only["source"] == "https://jobs.acme.example/1/apply"
+    assert "source" not in no_url
+    assert "url" not in no_url
+    assert no_url["ats"] == "greenhouse"
 
 
 def test_job_metadata_omits_missing_values() -> None:
@@ -387,3 +407,160 @@ def test_no_company_suggestions_explains_the_prefix_match() -> None:
     text = format_company_suggestions("zzzz", [])
 
     assert text.startswith('No company matched "zzzz".')
+
+
+def test_warnings_are_read_as_messages_with_close_company_matches() -> None:
+    warning = {
+        "code": "companies_unmatched",
+        "field": "companies.include",
+        "message": "No company matched: Glenmark.",
+    }
+    payload = search_page(
+        0,
+        warnings=[warning, "not a warning", {"code": "silent"}],
+        filters={
+            "companies": {
+                "suggestions": [
+                    {
+                        "query": "Glenmark",
+                        "companies": [{"name": "Glenmark Pharma", "ids": ["id-1"]}],
+                    }
+                ]
+            }
+        },
+    )
+
+    assert response_warnings(payload) == [warning, {"code": "silent"}]
+    assert warning_messages(payload) == [
+        "No company matched: Glenmark.",
+        'Closest companies to "Glenmark": Glenmark Pharma (ids: id-1)',
+    ]
+    assert response_warnings(search_page(1)) == []
+    assert warning_messages({"warnings": "broken"}) == []
+
+
+def test_filter_values_list_each_value_with_its_job_count() -> None:
+    text = format_filter_values(
+        "industries",
+        "soft",
+        [
+            {"key": "Software Development", "count": 120431},
+            {"key": "Software, Data & AI", "count": 1},
+        ],
+    )
+
+    assert text == (
+        '2 `industries` values matching "soft", most jobs first. Pass the values '
+        "exactly as written in the `industries` (or `exclude_industries`) filter "
+        "of jobo_job_search.\n\n"
+        "1. Software Development - 120,431 jobs\n"
+        "2. Software, Data & AI - 1 job"
+    )
+
+
+def test_filter_values_of_sources_name_no_exclude_twin() -> None:
+    text = format_filter_values("sources", "", [{"key": "greenhouse", "count": 9}])
+
+    assert text.startswith("1 `sources` value, most jobs first.")
+    assert "in the `sources` filter of jobo_job_search." in text
+    assert "exclude_sources" not in text
+
+
+def test_filter_values_of_named_facets_show_the_name_and_its_parent() -> None:
+    categories = format_filter_values(
+        "job_categories", "", [{"key": "healthcare", "name": "Healthcare", "count": 5}]
+    )
+    subcategories = format_filter_values(
+        "job_subcategories",
+        "nurs",
+        [{"key": "nursing", "name": "Nursing", "parent": "healthcare", "count": 3}],
+    )
+
+    assert "1. Healthcare - 5 jobs" in categories
+    assert "1. Nursing (category: healthcare) - 3 jobs" in subcategories
+    assert "`job_subcategories` (or `exclude_job_subcategories`)" in subcategories
+
+
+def test_filter_values_of_occupations_give_the_id_to_filter_on() -> None:
+    text = format_filter_values(
+        "occupations",
+        "",
+        [
+            {
+                "key": "esco:8d3e8aaa",
+                "name": "Registered Nurse",
+                "parent": "nursing",
+                "count": 4210,
+            },
+            {"key": "jobo:unlabelled", "count": 2},
+        ],
+    )
+
+    assert "Pass the ids in the `occupation_ids` (or `exclude_occupation_ids`)" in text
+    assert (
+        "1. Registered Nurse - id: esco:8d3e8aaa (subcategory: nursing) - 4,210 jobs"
+        in text
+    )
+    assert "2. jobo:unlabelled - id: jobo:unlabelled - 2 jobs" in text
+
+
+def test_no_filter_values_explains_the_prefix_match() -> None:
+    assert format_filter_values("skills", "zzz", []).startswith(
+        'No `skills` value matches "zzz". The lookup matches the start of a value'
+    )
+    assert format_filter_values("skills", "", []) == (
+        "The API lists no `skills` values at the moment."
+    )
+
+
+def test_occupation_matches_show_the_id_and_where_it_sits() -> None:
+    text = format_occupation_matches(
+        "nurse",
+        [
+            {
+                "id": "esco:8d3e8aaa",
+                "name": "Registered Nurse",
+                "category": "Healthcare",
+                "subcategory": "Nursing",
+            },
+            {"id": "jobo:x", "name": "Nurse Aide", "category": "", "subcategory": ""},
+        ],
+    )
+
+    assert text == (
+        '2 occupations matching "nurse". Pass the ids in the `occupation_ids` (or '
+        "`exclude_occupation_ids`) filter of jobo_job_search.\n\n"
+        "1. Registered Nurse - id: esco:8d3e8aaa (Healthcare > Nursing)\n"
+        "2. Nurse Aide - id: jobo:x"
+    )
+    assert format_occupation_matches("zzz", []).startswith(
+        'No occupation matches "zzz".'
+    )
+
+
+def test_location_suggestions_are_written_as_the_location_filter_takes_them() -> None:
+    text = format_location_suggestions(
+        "spring",
+        [
+            {"display_name": "Springfield, Illinois, United States", "city": "x"},
+            {"city": "Springfield", "region": "Missouri", "country": "United States"},
+            {"city": "Berlin", "region": "Berlin", "country": "Germany"},
+            {"display_name": "Springfield, Illinois, United States"},  # a repeat
+            {"latitude": 1.0},  # nothing to show
+        ],
+    )
+
+    assert text == (
+        '3 places matching "spring". Pass one, exactly as written, as the '
+        "`location` filter of jobo_job_search.\n\n"
+        "1. Springfield, Illinois, United States\n"
+        "2. Springfield, Missouri, United States\n"
+        "3. Berlin, Germany"
+    )
+
+
+def test_no_location_suggestions_point_back_at_the_search() -> None:
+    text = format_location_suggestions("zz", [])
+
+    assert text.startswith('No place matched "zz".')
+    assert "jobo_job_search also takes a free-form `location`" in text

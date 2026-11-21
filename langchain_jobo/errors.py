@@ -4,15 +4,31 @@ Every non-2xx response becomes a `JoboAPIError` subclass chosen by status code.
 Branch on the class or on `status_code` first, then on the stable `code` the
 API sends on most endpoint errors (`invalid_cursor`, `rate_limit_exceeded`,
 `feed_cursor_restart_required`, ...). `detail` is prose and may be reworded.
+
+A component that cannot work as configured (no API key, or a sandbox key given
+to the feed loader) raises `JoboConfigurationError` when it is constructed,
+before any request is made.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+#: `code` of the 404 a sandbox key gets from an endpoint the sandbox lacks.
+NOT_AVAILABLE_IN_SANDBOX = "not_available_in_sandbox"
+
 
 class JoboError(Exception):
     """Base class for everything this package raises."""
+
+
+class JoboConfigurationError(JoboError):
+    """A component was set up in a way that cannot work. Raised at construction.
+
+    Two cases: no API key was passed and `JOBO_API_KEY` is unset or blank, or
+    a sandbox key (`jbe_test_`) was given to a component the sandbox does not
+    serve, such as `JoboFeedLoader`.
+    """
 
 
 class JoboConnectionError(JoboError):
@@ -50,7 +66,19 @@ class JoboAPIError(JoboError):
 
 
 class JoboValidationError(JoboAPIError):
-    """HTTP 400: the request is invalid. Includes `invalid_cursor` on the feed."""
+    """HTTP 400: the request is invalid. Includes `invalid_cursor` on the feed.
+
+    Attributes:
+        errors: The API's per-field messages, e.g.
+            `{"page_size": ["page_size must be between 1 and 100."]}`. Empty
+            when the response named no fields. The same text is part of the
+            exception message.
+    """
+
+    @property
+    def errors(self) -> dict[str, list[str]]:
+        """The API's per-field validation messages, keyed by field."""
+        return field_errors(self.body)
 
 
 class JoboAuthenticationError(JoboAPIError):
@@ -97,7 +125,17 @@ class JoboPermissionError(JoboAPIError):
 
 
 class JoboNotFoundError(JoboAPIError):
-    """HTTP 404: unknown id, or an endpoint a sandbox key cannot call."""
+    """HTTP 404: unknown id, or an endpoint a sandbox key cannot call.
+
+    Attributes:
+        not_available_in_sandbox: Whether the API refused the endpoint because
+            the key is a sandbox key (`code == "not_available_in_sandbox"`).
+    """
+
+    @property
+    def not_available_in_sandbox(self) -> bool:
+        """Whether a sandbox key called an endpoint the sandbox does not serve."""
+        return self.code == NOT_AVAILABLE_IN_SANDBOX
 
 
 class JoboConflictError(JoboAPIError):
@@ -123,11 +161,31 @@ class JoboFeedCursorRestartRequiredError(JoboConflictError):
 
 
 class JoboRateLimitError(JoboAPIError):
-    """HTTP 429: a rate-limit window is exhausted. `retry_after` says how long."""
+    """HTTP 429: a rate-limit window is exhausted.
+
+    `retry_after` holds the seconds to wait, and the message states them.
+    """
 
 
 class JoboServerError(JoboAPIError):
     """HTTP 5xx: the API failed or is temporarily unavailable."""
+
+
+def field_errors(body: Any) -> dict[str, list[str]]:
+    """The `errors` map of a validation problem: field name to its messages."""
+    raw = body.get("errors") if isinstance(body, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    errors: dict[str, list[str]] = {}
+    for field, messages in raw.items():
+        if isinstance(messages, str):
+            messages = [messages]
+        if not isinstance(messages, list):
+            continue
+        texts = [m.strip() for m in messages if isinstance(m, str) and m.strip()]
+        if texts:
+            errors[str(field)] = texts
+    return errors
 
 
 def _int_field(body: Any, key: str) -> int | None:
@@ -147,8 +205,10 @@ def _str_field(body: Any, key: str) -> str | None:
 
 
 __all__ = [
+    "NOT_AVAILABLE_IN_SANDBOX",
     "JoboAPIError",
     "JoboAuthenticationError",
+    "JoboConfigurationError",
     "JoboConflictError",
     "JoboConnectionError",
     "JoboError",
@@ -159,4 +219,5 @@ __all__ = [
     "JoboRateLimitError",
     "JoboServerError",
     "JoboValidationError",
+    "field_errors",
 ]

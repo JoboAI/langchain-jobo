@@ -1,9 +1,13 @@
 """Small sync + async HTTP client for the Jobo API.
 
-Internal. It owns the three things every component needs to get right:
+Internal. It owns the things every component needs to get right:
 
+- the key: resolved from the argument or `JOBO_API_KEY` when the component is
+  built, so a missing key fails there and not on the first request;
 - headers: `X-Api-Key`, a `User-Agent`, and `X-Jobo-Client: langchain` so
   traffic can be attributed to this integration;
+- connections: one `httpx.Client` and one `httpx.AsyncClient` per event loop
+  are kept and reused, and closed by `close()` / `aclose()`;
 - retries: only `429`, `500` and `503` (and failures to connect) are retried,
   `Retry-After` is honoured, and `402` / `409` are never retried;
 - errors: every non-2xx response is raised as a typed `JoboAPIError`.
@@ -12,10 +16,13 @@ Internal. It owns the three things every component needs to get right:
 from __future__ import annotations
 
 import asyncio
+import os
 import random
+import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
+from types import TracebackType
 from typing import Any
 
 import httpx
@@ -25,6 +32,7 @@ from langchain_jobo._version import __version__
 from langchain_jobo.errors import (
     JoboAPIError,
     JoboAuthenticationError,
+    JoboConfigurationError,
     JoboConflictError,
     JoboConnectionError,
     JoboError,
@@ -35,6 +43,7 @@ from langchain_jobo.errors import (
     JoboRateLimitError,
     JoboServerError,
     JoboValidationError,
+    field_errors,
 )
 
 DEFAULT_BASE_URL = "https://connect.jobo.world"
@@ -49,6 +58,15 @@ DEFAULT_MAX_RETRY_WAIT = 60.0
 
 CLIENT_NAME = "langchain"
 USER_AGENT = f"langchain-jobo/{__version__}"
+
+API_KEY_ENV = "JOBO_API_KEY"
+API_KEYS_URL = "https://enterprise.jobo.world/api-keys"
+#: Keys with this prefix are answered from the sandbox's fictional data.
+SANDBOX_KEY_PREFIX = "jbe_test_"
+MISSING_KEY_MESSAGE = (
+    f"A Jobo API key is required. Pass api_key=... or set the {API_KEY_ENV} "
+    f"environment variable. Create a key at {API_KEYS_URL}"
+)
 
 _RETRYABLE_STATUSES = frozenset({429, 500, 503})
 _BACKOFF_CAP_SECONDS = 30.0
@@ -87,6 +105,54 @@ class JoboResponse:
     usage: JoboUsage
 
 
+def resolve_api_key(api_key: SecretStr | str | None = None) -> SecretStr:
+    """Return the key to use, trimmed, or raise when there is none.
+
+    Args:
+        api_key: The key a component was given. `None` reads `JOBO_API_KEY`.
+
+    Raises:
+        JoboConfigurationError: No key was given and the environment variable
+            is unset, or the key is blank.
+    """
+    if api_key is None:
+        api_key = os.environ.get(API_KEY_ENV, "")
+    value = (
+        api_key.get_secret_value() if isinstance(api_key, SecretStr) else str(api_key)
+    ).strip()
+    if not value:
+        raise JoboConfigurationError(MISSING_KEY_MESSAGE)
+    return SecretStr(value)
+
+
+def is_sandbox_key(api_key: SecretStr | str) -> bool:
+    """Whether the key is a sandbox key (`jbe_test_...`)."""
+    value = (
+        api_key.get_secret_value() if isinstance(api_key, SecretStr) else str(api_key)
+    )
+    return value.strip().startswith(SANDBOX_KEY_PREFIX)
+
+
+def require_live_key(api_key: SecretStr | str, component: str, serves: str) -> None:
+    """Refuse a sandbox key for a component the sandbox does not serve.
+
+    Args:
+        api_key: The resolved key.
+        component: Class name for the message, e.g. `JoboFeedLoader`.
+        serves: What the component reads, e.g. `the job feed`.
+
+    Raises:
+        JoboConfigurationError: The key is a sandbox key.
+    """
+    if is_sandbox_key(api_key):
+        msg = (
+            f"{component} needs a live API key (jbe_live_...). Sandbox keys "
+            f"({SANDBOX_KEY_PREFIX}...) serve job search and job lookups only, "
+            f"not {serves}. Create a live key at {API_KEYS_URL}"
+        )
+        raise JoboConfigurationError(msg)
+
+
 class _AttemptError(Exception):
     """An attempt that failed, and whether another attempt may help."""
 
@@ -121,21 +187,19 @@ class JoboClient:
             max_retry_wait: Longest single wait, in seconds, the client will
                 sleep through before giving up and raising.
             http_client: Optional `httpx.Client` to send sync requests with.
+                It is never closed by this client.
             http_async_client: Optional `httpx.AsyncClient` for async requests.
+                It is never closed by this client.
+
+        Raises:
+            JoboConfigurationError: The key is blank.
+            ValueError: `max_retries` is negative.
         """
-        secret = api_key if isinstance(api_key, SecretStr) else SecretStr(api_key)
-        if not secret.get_secret_value().strip():
-            msg = (
-                "A Jobo API key is required. Pass api_key=... or set the "
-                "JOBO_API_KEY environment variable. Create a key at "
-                "https://enterprise.jobo.world/api-keys"
-            )
-            raise ValueError(msg)
         if max_retries < 0:
             msg = "max_retries must be 0 or greater."
             raise ValueError(msg)
 
-        self._api_key = secret
+        self._api_key = resolve_api_key(api_key)
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
@@ -143,6 +207,12 @@ class JoboClient:
         self._http_client = http_client
         self._http_async_client = http_async_client
         self._owned_client: httpx.Client | None = None
+        self._owned_client_lock = threading.Lock()
+        # An `httpx.AsyncClient` belongs to the event loop it first ran on, so
+        # one is kept per loop, until that loop has closed.
+        self._owned_async_clients: dict[
+            asyncio.AbstractEventLoop, httpx.AsyncClient
+        ] = {}
         self._sleep: Callable[[float], None] = time.sleep
         self._asleep: Callable[[float], Awaitable[None]] = asyncio.sleep
         self._random: Callable[[float, float], float] = random.uniform
@@ -150,6 +220,22 @@ class JoboClient:
     def __repr__(self) -> str:
         """Represent the client without its key."""
         return f"JoboClient(base_url={self.base_url!r})"
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> JoboClient:
+        """Copy the settings; the copy opens connections of its own.
+
+        Connection pools and locks cannot be copied. HTTP clients that were
+        passed in are shared with the copy, not duplicated.
+        """
+        return JoboClient(
+            self._api_key,
+            base_url=self.base_url,
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            max_retry_wait=self.max_retry_wait,
+            http_client=self._http_client,
+            http_async_client=self._http_async_client,
+        )
 
     # ------------------------------------------------------------------ sync
 
@@ -185,15 +271,32 @@ class JoboClient:
     def _sync_client(self) -> httpx.Client:
         if self._http_client is not None:
             return self._http_client
-        if self._owned_client is None:
-            self._owned_client = httpx.Client()
-        return self._owned_client
+        with self._owned_client_lock:
+            if self._owned_client is None:
+                self._owned_client = httpx.Client()
+            return self._owned_client
 
     def close(self) -> None:
-        """Close the HTTP client this instance created, if it created one."""
-        if self._owned_client is not None:
-            self._owned_client.close()
-            self._owned_client = None
+        """Close the sync HTTP client this instance created, if it created one.
+
+        A client passed in as `http_client` is left open. The instance stays
+        usable: the next request opens a new client.
+        """
+        with self._owned_client_lock:
+            client, self._owned_client = self._owned_client, None
+        if client is not None:
+            client.close()
+
+    def __enter__(self) -> JoboClient:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
 
     # ----------------------------------------------------------------- async
 
@@ -208,16 +311,7 @@ class JoboClient:
     ) -> JoboResponse:
         """Async twin of `request`."""
         kwargs = self._request_kwargs(method, path, params, json, timeout)
-        if self._http_async_client is not None:
-            return await self._arequest_with(self._http_async_client, kwargs)
-        # A fresh client per call: an `httpx.AsyncClient` must not be shared
-        # across event loops, and callers may well use more than one.
-        async with httpx.AsyncClient() as client:
-            return await self._arequest_with(client, kwargs)
-
-    async def _arequest_with(
-        self, client: httpx.AsyncClient, kwargs: dict[str, Any]
-    ) -> JoboResponse:
+        client = self._async_client()
         attempt = 0
         while True:
             try:
@@ -233,6 +327,45 @@ class JoboClient:
                 await self._asleep(delay)
                 attempt += 1
 
+    def _async_client(self) -> httpx.AsyncClient:
+        """The client for the running event loop, opened on first use."""
+        if self._http_async_client is not None:
+            return self._http_async_client
+        loop = asyncio.get_running_loop()
+        client = self._owned_async_clients.get(loop)
+        if client is None:
+            # A client whose loop has closed can neither be used nor awaited
+            # shut: let go of it, so repeated `asyncio.run()` calls do not
+            # pile up one dead client each.
+            for closed in [o for o in self._owned_async_clients if o.is_closed()]:
+                del self._owned_async_clients[closed]
+            client = httpx.AsyncClient()
+            self._owned_async_clients[loop] = client
+        return client
+
+    async def aclose(self) -> None:
+        """Close the HTTP clients this instance created.
+
+        Closes the async client of the running event loop and the sync client.
+        Clients passed in as `http_client` / `http_async_client` are left
+        open. The instance stays usable: the next request opens a new client.
+        """
+        client = self._owned_async_clients.pop(asyncio.get_running_loop(), None)
+        if client is not None:
+            await client.aclose()
+        self.close()
+
+    async def __aenter__(self) -> JoboClient:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
     # ---------------------------------------------------------------- shared
 
     def _request_kwargs(
@@ -244,7 +377,7 @@ class JoboClient:
         timeout: float | None,
     ) -> dict[str, Any]:
         headers = {
-            "X-Api-Key": self._api_key.get_secret_value().strip(),
+            "X-Api-Key": self._api_key.get_secret_value(),
             "Accept": "application/json",
             "User-Agent": USER_AGENT,
             "X-Jobo-Client": CLIENT_NAME,
@@ -338,6 +471,11 @@ def _to_seconds(value: Any) -> float | None:
     return None
 
 
+def _sentence(text: str) -> str:
+    """End the text with a full stop unless it already ends a sentence."""
+    return text if text.endswith((".", "!", "?")) else f"{text}."
+
+
 _ERROR_BY_STATUS: dict[int, type[JoboAPIError]] = {
     400: JoboValidationError,
     401: JoboAuthenticationError,
@@ -378,6 +516,16 @@ def _error_from_response(response: httpx.Response) -> JoboAPIError:
         message += f" ({code})"
     if detail:
         message += f": {detail}"
+    # A validation problem names the offending fields in `errors`; without
+    # them the message is only "One or more validation errors occurred."
+    fields = "; ".join(
+        f"{field}: {'; '.join(text.rstrip('.') for text in texts)}"
+        for field, texts in field_errors(body).items()
+    )
+    if fields:
+        message = f"{_sentence(message)} {fields}."
+    if status == 429 and retry_after is not None:
+        message = f"{_sentence(message)} Retry after {retry_after:g} seconds."
 
     error_cls = _ERROR_BY_STATUS.get(status)
     if status == 409 and code == "feed_cursor_restart_required":

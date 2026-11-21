@@ -2,31 +2,47 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Iterator, Mapping
-from typing import Any
+from datetime import datetime
+from types import TracebackType
+from typing import Any, TypeVar
 
 import httpx
 from langchain_core.document_loaders import BaseLoader
 from langchain_core.documents import Document
-from langchain_core.utils import secret_from_env
 from pydantic import SecretStr
 
-from langchain_jobo._base import _MISSING_KEY_MESSAGE
 from langchain_jobo._client import (
     DEFAULT_BASE_URL,
     DEFAULT_FEED_TIMEOUT,
     DEFAULT_MAX_RETRIES,
     JoboClient,
     JoboResponse,
+    require_live_key,
+    resolve_api_key,
 )
 from langchain_jobo.filters import (
     API_MAX_BATCH_SIZE,
     JoboFeedFilters,
+    JoboFeedFiltersDict,
     build_feed_body,
+    to_wire_timestamp,
 )
-from langchain_jobo.formatting import job_to_document
+from langchain_jobo.formatting import (
+    job_to_document,
+    response_warnings,
+    warning_messages,
+)
+
+logger = logging.getLogger(__name__)
+
+_Self = TypeVar("_Self", bound="JoboFeedLoader")
 
 _FEED_PATH = "/api/jobs/feed"
+_EXPIRED_PATH = "/api/jobs/expired"
+#: The API's own batch-size ceiling on the expired-job-ids endpoint.
+API_MAX_EXPIRED_BATCH_SIZE = 10_000
 
 
 def _plan_batch_size(max_jobs: int | None, batch_size: int) -> int:
@@ -100,9 +116,9 @@ class _Scan:
         estimated_total = payload.get("estimated_total")
         if isinstance(estimated_total, int) and loader.estimated_total is None:
             loader.estimated_total = estimated_total
-        warnings = payload.get("warnings")
-        if isinstance(warnings, list):
-            loader.warnings.extend(w for w in warnings if isinstance(w, dict))
+        loader.warnings.extend(response_warnings(payload))
+        for message in warning_messages(payload):
+            logger.warning("Jobo feed: %s", message)
         return jobs
 
     def batch_done(self) -> None:
@@ -130,7 +146,8 @@ class JoboFeedLoader(BaseLoader):
     When `max_jobs` is not a multiple of the batch size it settles for slightly
     fewer rather than ask the feed for a partial batch (see `batch_size`).
 
-    The feed is not available to sandbox (`jbe_test_`) keys.
+    The feed is not available to sandbox (`jbe_test_`) keys, so the loader
+    refuses one when it is built.
 
     Setup:
         Install `langchain-jobo` and set the `JOBO_API_KEY` environment variable.
@@ -142,15 +159,15 @@ class JoboFeedLoader(BaseLoader):
 
     Instantiate:
         ```python
-        from langchain_jobo import JoboFeedLoader
+        from langchain_jobo import IncludeExclude, JoboFeedFilters, JoboFeedLoader
 
         loader = JoboFeedLoader(
             max_jobs=500,
-            filters={
-                "sources": ["greenhouse"],
-                "work_models": ["remote"],
-                "job_categories": {"include": ["Healthcare"]},
-            },
+            filters=JoboFeedFilters(
+                sources=["greenhouse"],
+                work_models=["remote"],
+                job_categories=IncludeExclude(include=["Healthcare"]),
+            ),
         )
         ```
 
@@ -168,6 +185,11 @@ class JoboFeedLoader(BaseLoader):
         loader = JoboFeedLoader(max_jobs=500, cursor=saved_cursor)
         ```
 
+    Drop jobs that have closed from an index built with the loader:
+        ```python
+        vector_store.delete(ids=loader.expired_job_ids(expired_since=last_sync))
+        ```
+
     Attributes:
         last_cursor: Cursor to resume from. It advances once every job of a
             batch has been yielded, so a consumer that stops part-way through a
@@ -181,6 +203,7 @@ class JoboFeedLoader(BaseLoader):
         estimated_total: The API's estimate of how many jobs the scan will
             deliver, sent on the first page of a new scan.
         warnings: Non-fatal warnings from the API, e.g. `companies_unmatched`.
+            Each is also logged on the `langchain_jobo` logger.
         batch_size: Jobs requested per call, after planning for `max_jobs`.
     """
 
@@ -189,7 +212,7 @@ class JoboFeedLoader(BaseLoader):
         *,
         max_jobs: int | None,
         api_key: SecretStr | str | None = None,
-        filters: JoboFeedFilters | Mapping[str, Any] | None = None,
+        filters: JoboFeedFilters | JoboFeedFiltersDict | None = None,
         cursor: str | None = None,
         batch_size: int = API_MAX_BATCH_SIZE,
         include_description: bool = True,
@@ -205,9 +228,10 @@ class JoboFeedLoader(BaseLoader):
             max_jobs: Required. The most jobs one pass may load, or `None` to
                 read the whole feed. There is no default on purpose.
             api_key: Jobo API key. Read from `JOBO_API_KEY` when not passed.
-            filters: Feed filters (`JoboFeedFilters` or a dict with its keys).
-                Unknown keys are rejected. Ignored when `cursor` is given: a
-                cursor keeps the filters of the scan it came from.
+            filters: Feed filters: a `JoboFeedFilters`, or a dict with its
+                keys (`JoboFeedFiltersDict`). Unknown keys are rejected.
+                Ignored when `cursor` is given: a cursor keeps the filters of
+                the scan it came from.
             cursor: `last_cursor` of an earlier run, to resume that scan.
             batch_size: Upper bound on jobs per request, 1-1000. With
                 `max_jobs` set, the loader uses the largest size at or below
@@ -223,6 +247,12 @@ class JoboFeedLoader(BaseLoader):
                 retried.
             http_client: Optional `httpx.Client` to send sync requests with.
             http_async_client: Optional `httpx.AsyncClient` for async requests.
+
+        Raises:
+            JoboConfigurationError: No API key was passed or found, or the key
+                is a sandbox key, which the feed does not serve.
+            ValueError: `max_jobs` or `batch_size` is out of range.
+            pydantic.ValidationError: `filters` has an unknown key or value.
         """
         if max_jobs is not None and (
             isinstance(max_jobs, bool) or not isinstance(max_jobs, int) or max_jobs < 1
@@ -237,10 +267,8 @@ class JoboFeedLoader(BaseLoader):
             msg = f"batch_size must be between 1 and {API_MAX_BATCH_SIZE}."
             raise ValueError(msg)
 
-        if api_key is None:
-            api_key = secret_from_env(
-                "JOBO_API_KEY", error_message=_MISSING_KEY_MESSAGE
-            )()
+        key = resolve_api_key(api_key)
+        require_live_key(key, type(self).__name__, "the job feed")
 
         self.max_jobs = max_jobs
         self.filters = JoboFeedFilters.model_validate(filters or {})
@@ -249,7 +277,7 @@ class JoboFeedLoader(BaseLoader):
         self.include_description = include_description
         self.timeout = timeout
         self._client = JoboClient(
-            api_key,
+            key,
             base_url=base_url,
             timeout=timeout,
             max_retries=max_retries,
@@ -293,6 +321,152 @@ class JoboFeedLoader(BaseLoader):
             for job in scan.read(response):
                 yield self._document(job)
             scan.batch_done()
+
+    # ---------------------------------------------------------- expired jobs
+
+    @staticmethod
+    def _expired_params(
+        expired_since: datetime | None, batch_size: int, cursor: str | None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"batch_size": batch_size}
+        if expired_since is not None:
+            params["expired_since"] = to_wire_timestamp(expired_since)
+        if cursor:
+            params["cursor"] = cursor
+        return params
+
+    @staticmethod
+    def _check_expired_batch_size(batch_size: int) -> None:
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or not 1 <= batch_size <= API_MAX_EXPIRED_BATCH_SIZE
+        ):
+            msg = f"batch_size must be between 1 and {API_MAX_EXPIRED_BATCH_SIZE}."
+            raise ValueError(msg)
+
+    @staticmethod
+    def _read_expired(response: JoboResponse) -> tuple[list[str], str | None]:
+        """A page of expired ids, and the cursor of the next page if any."""
+        payload = response.data if isinstance(response.data, dict) else {}
+        raw_ids = payload.get("job_ids") or []
+        ids = [job_id for job_id in raw_ids if isinstance(job_id, str)]
+        next_cursor = payload.get("next_cursor")
+        more = bool(payload.get("has_more")) and isinstance(next_cursor, str)
+        return ids, next_cursor if more and next_cursor else None
+
+    def lazy_expired_job_ids(
+        self, expired_since: datetime | None = None, *, batch_size: int = 1000
+    ) -> Iterator[str]:
+        """Yield the ids of jobs that have closed, following the API's cursor.
+
+        Calls `GET /api/jobs/expired`, which is free. The ids are the
+        `Document.id`s this loader yields, so they can be handed to a vector
+        store's `delete(ids=...)` to drop closed jobs from an index. `max_jobs`
+        does not apply: every id is read.
+
+        Args:
+            expired_since: Only jobs that expired on or after this time. A
+                naive value is read as UTC. The API goes back 7 days at most,
+                and defaults to the last 24 hours when this is left out.
+            batch_size: Ids requested per call, 1-10000.
+
+        Raises:
+            ValueError: `batch_size` is out of range.
+            JoboValidationError: The API refused `expired_since`, e.g. because
+                it is more than 7 days ago.
+        """
+        self._check_expired_batch_size(batch_size)
+        cursor: str | None = None
+        while True:
+            response = self._client.request(
+                "GET",
+                _EXPIRED_PATH,
+                params=self._expired_params(expired_since, batch_size, cursor),
+                timeout=self.timeout,
+            )
+            ids, next_cursor = self._read_expired(response)
+            yield from ids
+            if next_cursor is None or next_cursor == cursor:
+                return
+            cursor = next_cursor
+
+    def expired_job_ids(
+        self, expired_since: datetime | None = None, *, batch_size: int = 1000
+    ) -> list[str]:
+        """Return the ids of jobs that have closed. See `lazy_expired_job_ids`."""
+        return list(self.lazy_expired_job_ids(expired_since, batch_size=batch_size))
+
+    async def alazy_expired_job_ids(
+        self, expired_since: datetime | None = None, *, batch_size: int = 1000
+    ) -> AsyncIterator[str]:
+        """Async twin of `lazy_expired_job_ids`."""
+        self._check_expired_batch_size(batch_size)
+        cursor: str | None = None
+        while True:
+            response = await self._client.arequest(
+                "GET",
+                _EXPIRED_PATH,
+                params=self._expired_params(expired_since, batch_size, cursor),
+                timeout=self.timeout,
+            )
+            ids, next_cursor = self._read_expired(response)
+            for job_id in ids:
+                yield job_id
+            if next_cursor is None or next_cursor == cursor:
+                return
+            cursor = next_cursor
+
+    async def aexpired_job_ids(
+        self, expired_since: datetime | None = None, *, batch_size: int = 1000
+    ) -> list[str]:
+        """Async twin of `expired_job_ids`."""
+        return [
+            job_id
+            async for job_id in self.alazy_expired_job_ids(
+                expired_since, batch_size=batch_size
+            )
+        ]
+
+    # ------------------------------------------------------------ connections
+
+    def close(self) -> None:
+        """Close the HTTP connections this loader opened.
+
+        An `http_client` you passed in is left open. The loader stays usable:
+        its next call opens a new connection.
+        """
+        self._client.close()
+
+    async def aclose(self) -> None:
+        """Close the HTTP connections this loader opened, sync and async.
+
+        Clients you passed in are left open. Call it on the event loop the
+        loader was used on.
+        """
+        await self._client.aclose()
+
+    def __enter__(self: _Self) -> _Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    async def __aenter__(self: _Self) -> _Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self.aclose()
 
 
 __all__ = ["JoboFeedLoader"]

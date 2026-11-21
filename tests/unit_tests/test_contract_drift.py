@@ -17,18 +17,28 @@ from typing import Any, get_args
 
 import pytest
 
-from langchain_jobo import JoboFeedFilters, JoboSearchInput, JoboSearchTool
+from langchain_jobo import (
+    JoboFeedFilters,
+    JoboFilterValuesTool,
+    JoboSearchFilters,
+    JoboSearchInput,
+    JoboSearchTool,
+)
 from langchain_jobo.filters import (
     CONTRACT_KEY_TO_FIELD,
+    CONTRACT_KEYS_SET_ON_THE_TOOL,
+    CompanyCategory,
     CompanyRevenue,
     CompanySize,
     DescriptionFormat,
     EmploymentType,
     ExperienceLevel,
+    FilterFacet,
     SearchSort,
     WorkModel,
     build_search_body,
 )
+from langchain_jobo.formatting import FACET_FILTERS
 
 CONTRACT_PATH = Path(__file__).resolve().parents[3] / "contracts" / "filters.json"
 
@@ -78,14 +88,18 @@ def test_contract_was_found_and_has_filters() -> None:
 
 
 def test_tool_schema_has_every_search_filter_in_the_contract() -> None:
+    """Every contract filter is a tool argument, or an option set on the tool."""
     schema_fields = set(JoboSearchInput.model_fields)
     tool_args = set(JoboSearchTool(api_key="jbe_test_drift").args)
 
     missing = sorted(
         descriptor["key"]
         for descriptor in search_filters()
-        if field_for(descriptor["key"]) not in schema_fields
-        or field_for(descriptor["key"]) not in tool_args
+        if descriptor["key"] not in CONTRACT_KEYS_SET_ON_THE_TOOL
+        and (
+            field_for(descriptor["key"]) not in schema_fields
+            or field_for(descriptor["key"]) not in tool_args
+        )
     )
 
     assert missing == [], (
@@ -93,18 +107,46 @@ def test_tool_schema_has_every_search_filter_in_the_contract() -> None:
     )
 
 
+def test_filters_kept_off_the_tool_schema_are_options_of_the_tool() -> None:
+    """A filter the model is not shown must still be settable, and sent."""
+    keys = {descriptor["key"] for descriptor in search_filters()}
+    by_key = {descriptor["key"]: descriptor for descriptor in search_filters()}
+
+    assert keys >= CONTRACT_KEYS_SET_ON_THE_TOOL
+    for key in CONTRACT_KEYS_SET_ON_THE_TOOL:
+        assert key in JoboSearchTool.model_fields, key
+        assert key not in JoboSearchInput.model_fields, key
+        body = build_search_body(JoboSearchInput(), **{key: sample_for(by_key[key])})
+        assert body, key
+
+
+def test_search_filters_model_has_every_search_filter_in_the_contract() -> None:
+    """`JoboSearchFilters` is what the retriever takes: it carries them all."""
+    missing = sorted(
+        descriptor["key"]
+        for descriptor in search_filters()
+        if descriptor["key"] not in CONTRACT_KEY_TO_FIELD
+        and descriptor["key"] not in JoboSearchFilters.model_fields
+    )
+
+    assert missing == []
+
+
 def test_every_search_filter_in_the_contract_reaches_the_request_body() -> None:
     """A field that validates but is never sent would be a silent no-op."""
     unsent: list[str] = []
     for descriptor in search_filters():
-        field = field_for(descriptor["key"])
-        if field not in JoboSearchInput.model_fields:
-            unsent.append(descriptor["key"])
-            continue
-        args = JoboSearchInput.model_validate({field: sample_for(descriptor)})
-        body = build_search_body(args, query=args.query)
+        key = descriptor["key"]
+        sample = sample_for(descriptor)
+        if key in CONTRACT_KEY_TO_FIELD:
+            args = JoboSearchInput.model_validate({field_for(key): sample})
+            body = build_search_body(args, query=args.query)
+        elif key in JoboSearchFilters.model_fields:
+            body = build_search_body(JoboSearchFilters.model_validate({key: sample}))
+        else:
+            body = {}
         if not body:
-            unsent.append(descriptor["key"])
+            unsent.append(key)
 
     assert unsent == []
 
@@ -123,6 +165,7 @@ def test_alias_map_only_names_real_contract_keys() -> None:
         ("experience_levels", ExperienceLevel),
         ("search_sorts", SearchSort),
         ("description_formats", DescriptionFormat),
+        ("company_categories", CompanyCategory),
         ("company_sizes", CompanySize),
         ("company_revenues", CompanyRevenue),
     ],
@@ -137,6 +180,8 @@ def test_search_filter_options_match_the_typed_fields() -> None:
         "work_model": WorkModel,
         "employment_type": EmploymentType,
         "experience_level": ExperienceLevel,
+        "company_categories": CompanyCategory,
+        "exclude_company_categories": CompanyCategory,
         "sort": SearchSort,
         "description_format": DescriptionFormat,
     }
@@ -144,6 +189,41 @@ def test_search_filter_options_match_the_typed_fields() -> None:
 
     for key, literal in typed.items():
         assert list(get_args(literal)) == by_key[key]["options"], key
+
+
+def test_company_category_fields_reject_values_outside_the_contract() -> None:
+    values = contract()["enums"]["company_categories"]
+
+    for field in ("company_categories", "exclude_company_categories"):
+        assert getattr(JoboSearchFilters.model_validate({field: values}), field) == (
+            values
+        )
+        schema = JoboSearchInput.model_json_schema()["properties"][field]
+        assert schema["anyOf"][0]["items"]["enum"] == values, field
+
+
+def test_lookup_facets_are_the_dynamic_option_sources_of_the_contract() -> None:
+    """`jobo_filter_values` lists every value set the contract loads at run time.
+
+    `companies` is the one source it does not list: `jobo_company_search` does.
+    """
+    sources = {
+        descriptor["dynamicOptions"]
+        for descriptor in search_filters()
+        if "dynamicOptions" in descriptor
+    }
+    schema = JoboFilterValuesTool(api_key="jbe_test_drift").args["facet"]
+
+    assert set(get_args(FilterFacet)) == sources - {"companies"}
+    assert set(schema["enum"]) == sources - {"companies"}
+    assert set(FACET_FILTERS) == set(get_args(FilterFacet))
+
+
+def test_each_lookup_facet_names_a_real_search_filter() -> None:
+    by_key = {descriptor["key"]: descriptor for descriptor in search_filters()}
+
+    for facet, filter_name in FACET_FILTERS.items():
+        assert by_key[filter_name]["dynamicOptions"] == facet
 
 
 def test_feed_filters_cover_every_feed_key_in_the_contract() -> None:

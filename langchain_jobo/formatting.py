@@ -23,6 +23,21 @@ _PERIOD_PHRASES = {
 
 _MAX_SUGGESTED_COMPANIES = 3
 
+#: The search filter each lookup facet's values go into.
+FACET_FILTERS: dict[str, str] = {
+    "sources": "sources",
+    "industries": "industries",
+    "skills": "skills",
+    "company_categories": "company_categories",
+    "job_categories": "job_categories",
+    "job_subcategories": "job_subcategories",
+    "occupations": "occupation_ids",
+}
+#: Facets whose values are names the taxonomy spells with capitals.
+_NAMED_FACETS = frozenset({"job_categories", "job_subcategories"})
+#: Search filters without an `exclude_` twin.
+_INCLUDE_ONLY_FILTERS = frozenset({"sources"})
+
 
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
@@ -168,15 +183,36 @@ def format_job_summary(job: Mapping[str, Any], index: int | None = None) -> str:
     return "\n".join([lines[0], *(f"{indent}{line}" for line in lines[1:])])
 
 
-def _warning_notes(payload: Mapping[str, Any]) -> list[str]:
-    notes: list[str] = []
+def response_warnings(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The non-fatal warnings of a search or feed response, as the API sent them."""
     warnings = payload.get("warnings")
-    if isinstance(warnings, Sequence) and not isinstance(warnings, (str, bytes)):
-        for warning in warnings:
-            message = _text(_mapping(warning).get("message"))
-            if message:
-                notes.append(f"Note: {message}")
+    if not isinstance(warnings, Sequence) or isinstance(warnings, (str, bytes)):
+        return []
+    return [dict(warning) for warning in warnings if isinstance(warning, Mapping)]
 
+
+def _warning_texts(payload: Mapping[str, Any]) -> list[str]:
+    texts = (_text(warning.get("message")) for warning in response_warnings(payload))
+    return [text for text in texts if text]
+
+
+def warning_messages(payload: Mapping[str, Any]) -> list[str]:
+    """What a response's warnings say, one line each, with close company matches.
+
+    A filter value the API could not use does not fail the request: it comes
+    back as a warning, often beside an empty result. These lines are what the
+    search tool tells the model and what the retriever and loader log.
+    """
+    return [*_warning_texts(payload), *_company_suggestion_notes(payload)]
+
+
+def _warning_notes(payload: Mapping[str, Any]) -> list[str]:
+    notes = [f"Note: {text}" for text in _warning_texts(payload)]
+    return [*notes, *_company_suggestion_notes(payload)]
+
+
+def _company_suggestion_notes(payload: Mapping[str, Any]) -> list[str]:
+    notes: list[str] = []
     companies = _mapping(_mapping(payload.get("filters")).get("companies"))
     suggestions = companies.get("suggestions")
     if isinstance(suggestions, Sequence) and not isinstance(suggestions, (str, bytes)):
@@ -377,9 +413,9 @@ def format_job_document(
         links.append(f"Listing: {listing_url}")
     if apply_url and apply_url != listing_url:
         links.append(f"Apply: {apply_url}")
-    source = _text(job.get("source"))
-    if source:
-        links.append(f"Source: {source}")
+    ats = _text(job.get("source"))
+    if ats:
+        links.append(f"ATS: {ats}")
     links.append(f"Job ID: {_text(job.get('id'))}")
     sections.append("\n".join(links))
 
@@ -391,11 +427,16 @@ def job_metadata(job: Mapping[str, Any]) -> dict[str, Any]:
 
     Values are strings and numbers only, so the metadata is accepted by vector
     stores that reject nested or null values.
+
+    `source` follows the LangChain convention: it says where the document came
+    from, which is the listing URL (the same value as `url`). The applicant
+    tracking system the listing was collected from is `ats`.
     """
     company = _mapping(job.get("company"))
     compensation = _mapping(job.get("compensation"))
     candidates: dict[str, Any] = {
         "id": _text(job.get("id")),
+        "source": _job_url(job),
         "url": _job_url(job),
         "apply_url": _text(job.get("apply_url")),
         "title": _text(job.get("title")),
@@ -414,7 +455,7 @@ def job_metadata(job: Mapping[str, Any]) -> dict[str, Any]:
         "created_at": _text(job.get("created_at")),
         "updated_at": _text(job.get("updated_at")),
         "valid_through": _text(job.get("valid_through")),
-        "source": _text(job.get("source")),
+        "ats": _text(job.get("source")),
     }
     return {key: value for key, value in candidates.items() if value not in ("", None)}
 
@@ -471,15 +512,156 @@ def format_company_suggestions(
     return "\n\n".join([header, "\n".join(lines)])
 
 
+def _jobs(count: Any) -> str:
+    if isinstance(count, bool) or not isinstance(count, int):
+        return ""
+    return f"{count:,} job{'' if count == 1 else 's'}"
+
+
+def _filter_hint(facet: str) -> str:
+    """Which jobo_job_search filter takes the values of `facet`."""
+    name = FACET_FILTERS.get(facet, facet)
+    twin = "" if name in _INCLUDE_ONLY_FILTERS else f" (or `exclude_{name}`)"
+    what = "the ids" if facet == "occupations" else "the values exactly as written"
+    return f"Pass {what} in the `{name}`{twin} filter of jobo_job_search."
+
+
+def format_filter_values(
+    facet: str, query: str, options: Sequence[Mapping[str, Any]]
+) -> str:
+    """Render one facet's values, each with its live job count.
+
+    Args:
+        facet: The facet that was listed, e.g. `industries`.
+        query: The text the values were narrowed by, or `""`.
+        options: The API's buckets: `key`, `count`, and on the occupation
+            facets `name` and `parent`.
+    """
+    matching = f' matching "{query}"' if query else ""
+    if not options:
+        if query:
+            return (
+                f'No `{facet}` value matches "{query}". The lookup matches the '
+                "start of a value: try a shorter spelling, or leave the query "
+                "out to see the most common values."
+            )
+        return f"The API lists no `{facet}` values at the moment."
+
+    lines: list[str] = []
+    for index, option in enumerate(options, start=1):
+        key = _text(option.get("key"))
+        name = _text(option.get("name"))
+        parent = _text(option.get("parent"))
+        if facet == "occupations":
+            line = f"{name or key} - id: {key}"
+            if parent:
+                line += f" (subcategory: {parent})"
+        else:
+            line = (name or key) if facet in _NAMED_FACETS else key
+            if parent:
+                line += f" (category: {parent})"
+        count = _jobs(option.get("count"))
+        lines.append(f"{index}. {line}{f' - {count}' if count else ''}")
+
+    total = len(options)
+    header = (
+        f"{total} `{facet}` value{'' if total == 1 else 's'}{matching}, most "
+        f"jobs first. {_filter_hint(facet)}"
+    )
+    return "\n\n".join([header, "\n".join(lines)])
+
+
+def format_occupation_matches(
+    query: str, occupations: Sequence[Mapping[str, Any]]
+) -> str:
+    """Render occupations found by name: the name, its id and where it sits.
+
+    Args:
+        query: The text the occupation names were searched for.
+        occupations: Matches with `id`, `name`, `category` and `subcategory`.
+    """
+    if not occupations:
+        return (
+            f'No occupation matches "{query}". Try one general word from the '
+            'job title, e.g. "nurse" or "developer".'
+        )
+
+    lines: list[str] = []
+    for index, occupation in enumerate(occupations, start=1):
+        path = " > ".join(
+            part
+            for part in (
+                _text(occupation.get("category")),
+                _text(occupation.get("subcategory")),
+            )
+            if part
+        )
+        line = f"{index}. {_text(occupation.get('name'))}"
+        line += f" - id: {_text(occupation.get('id'))}"
+        lines.append(f"{line} ({path})" if path else line)
+
+    total = len(occupations)
+    header = (
+        f'{total} occupation{"" if total == 1 else "s"} matching "{query}". '
+        f"{_filter_hint('occupations')}"
+    )
+    return "\n\n".join([header, "\n".join(lines)])
+
+
+def location_label(suggestion: Mapping[str, Any]) -> str:
+    """One suggested place as the text the `location` filter takes."""
+    label = _text(suggestion.get("display_name"))
+    if label:
+        return label
+    parts: list[str] = []
+    for key in ("city", "region", "country"):
+        part = _text(suggestion.get(key))
+        if part and part not in parts:
+            parts.append(part)
+    return ", ".join(parts)
+
+
+def format_location_suggestions(
+    query: str, suggestions: Sequence[Mapping[str, Any]]
+) -> str:
+    """Render place lookups: one line per place, as the search filter takes it."""
+    labels: list[str] = []
+    for suggestion in suggestions:
+        label = location_label(suggestion)
+        if label and label not in labels:
+            labels.append(label)
+    if not labels:
+        return (
+            f'No place matched "{query}". Lookups need at least 2 characters: '
+            "try a different spelling. jobo_job_search also takes a free-form "
+            "`location` and resolves it itself."
+        )
+
+    total = len(labels)
+    header = (
+        f'{total} place{"" if total == 1 else "s"} matching "{query}". Pass '
+        "one, exactly as written, as the `location` filter of jobo_job_search."
+    )
+    lines = [f"{index}. {label}" for index, label in enumerate(labels, start=1)]
+    return "\n\n".join([header, "\n".join(lines)])
+
+
 __all__ = [
+    "FACET_FILTERS",
     "format_company_suggestions",
     "format_compensation",
+    "format_filter_values",
     "format_job_document",
     "format_job_summary",
     "format_location",
+    "format_location_suggestions",
     "format_occupation",
+    "format_occupation_matches",
     "format_search_results",
     "job_metadata",
     "job_places",
     "job_to_document",
+    "location_label",
+    "response_warnings",
+    "warning_messages",
 ]
