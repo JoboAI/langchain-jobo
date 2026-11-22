@@ -1031,6 +1031,50 @@ def test_filter_values_finds_occupations_by_name_in_the_taxonomy() -> None:
     }
 
 
+def test_filter_values_ranks_a_whole_word_above_a_word_that_starts_with_it() -> None:
+    """Seen on the live taxonomy: "nurse" led with a nursery school teacher."""
+    taxonomy = {
+        "version": "v1",
+        "categories": [
+            {
+                "name": "Education",
+                "subcategories": [
+                    {
+                        "name": "Early Education",
+                        "occupations": [
+                            {"id": "esco:nursery", "name": "Nursery School Teacher"}
+                        ],
+                    }
+                ],
+            },
+            {
+                "name": "Healthcare",
+                "subcategories": [
+                    {
+                        "name": "Nursing",
+                        "occupations": [
+                            {"id": "esco:rn", "name": "Registered Nurse"},
+                            {"id": "esco:na", "name": "Nurse Assistant"},
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+    api = MockJobo(reply(200, taxonomy))
+    tool = JoboFilterValuesTool(**api.kwargs)
+
+    message = tool.invoke(
+        tool_call("jobo_filter_values", {"facet": "occupations", "query": "nurse"})
+    )
+
+    assert [option["name"] for option in message.artifact["options"]] == [
+        "Registered Nurse",
+        "Nurse Assistant",
+        "Nursery School Teacher",
+    ]
+
+
 def test_filter_values_occupation_search_matches_every_word_and_the_limit() -> None:
     api = MockJobo(reply(200, TAXONOMY))
     tool = JoboFilterValuesTool(**api.kwargs)

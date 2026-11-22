@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Literal
 from urllib.parse import quote
@@ -677,31 +678,39 @@ def _flatten_taxonomy(data: Any) -> list[dict[str, str]]:
     return rows
 
 
+#: The words of an occupation name, for whole-word matching.
+_WORD = re.compile(r"[a-z0-9]+")
+
+
 def _match_occupations(
     rows: list[dict[str, str]], query: str, limit: int
 ) -> list[dict[str, str]]:
     """Occupations whose name holds every word of `query`, best match first.
 
-    A whole-name match leads, then names that start with the query, then
-    names that contain its words, then occupations whose category or
-    subcategory does.
+    A whole-name match leads, then names that hold every query word as a
+    whole word ("nurse" finds Registered Nurse before Nursery School
+    Teacher), then names that start with the query, then names that contain
+    its words, then occupations whose category or subcategory does.
     """
     needle = query.lower()
     words = needle.split()
     ranked: list[tuple[int, int, dict[str, str]]] = []
     for index, row in enumerate(rows):
         name = row["name"].lower()
+        name_words = set(_WORD.findall(name))
         if name == needle:
             rank = 0
-        elif name.startswith(needle):
+        elif all(word in name_words for word in words):
             rank = 1
-        elif all(word in name for word in words):
+        elif name.startswith(needle):
             rank = 2
+        elif all(word in name for word in words):
+            rank = 3
         elif all(
             word in f"{name} {row['subcategory']} {row['category']}".lower()
             for word in words
         ):
-            rank = 3
+            rank = 4
         else:
             continue
         ranked.append((rank, index, row))
