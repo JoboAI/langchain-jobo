@@ -22,6 +22,9 @@ from langchain_jobo import (
     JoboInsufficientCreditsError,
     JoboNotFoundError,
     JoboValidationError,
+    aiter_expired_job_ids,
+    document_loaders,
+    iter_expired_job_ids,
 )
 from langchain_jobo.document_loaders import _plan_batch_size
 from tests.unit_tests.helpers import (
@@ -35,13 +38,23 @@ from tests.unit_tests.helpers import (
     reply,
 )
 
+#: The clock `expired_since` is checked against.
+NOW = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _frozen_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The 7-day limit on `expired_since` moves with the clock: pin it."""
+    monkeypatch.setattr(document_loaders, "_utcnow", lambda: NOW)
+
 
 class FakeFeed:
     """A feed of `total` jobs that behaves like `POST /api/jobs/feed`.
 
     The cursor is `"<offset>:<batch size>"`. As on the real feed, the scan's
     batch size is fixed by its first request, and a continuation may lower it
-    (for good) but never raise it.
+    (for good) but never raise it: asking for more gets a page of the scan's
+    size and a `batch_size_capped` warning.
     """
 
     def __init__(self, total: int) -> None:
@@ -49,9 +62,19 @@ class FakeFeed:
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
+        warnings: list[dict[str, str]] = []
         if "cursor" in body:
             offset, size = (int(part) for part in body["cursor"].split(":"))
-            size = min(size, int(body.get("batch_size", size)))
+            asked = int(body.get("batch_size", size))
+            if asked > size:
+                warnings.append(
+                    {
+                        "code": "batch_size_capped",
+                        "field": "batch_size",
+                        "message": f"This scan started with batch_size {size}.",
+                    }
+                )
+            size = min(size, asked)
         else:
             offset, size = 0, int(body.get("batch_size", 1000))
 
@@ -65,6 +88,8 @@ class FakeFeed:
         }
         if "cursor" not in body:
             payload["estimated_total"] = self.total
+        if warnings:
+            payload["warnings"] = warnings
         return httpx.Response(
             200, json=payload, headers={"X-Jobs-Billed": str(len(jobs))}
         )
@@ -419,6 +444,58 @@ def test_resume_never_reads_past_the_budget_of_a_larger_cursor() -> None:
     assert loader.jobs_billed == 3
 
 
+def test_a_resumed_scan_with_smaller_pages_is_read_to_the_budget() -> None:
+    """The cursor keeps its scan's batch size: plan with it, do not stop early."""
+    api = feed(total=100)
+    loader = JoboFeedLoader(max_jobs=10, cursor="0:2", **api.kwargs)
+
+    documents = loader.load()
+
+    assert loader.batch_size == 10
+    assert titles(documents) == [f"Senior Backend Engineer {i}" for i in range(10)]
+    assert api.bodies == [
+        {"cursor": "0:2", "batch_size": 10},
+        {"cursor": "2:2", "batch_size": 2},
+        {"cursor": "4:2", "batch_size": 2},
+        {"cursor": "6:2", "batch_size": 2},
+        {"cursor": "8:2", "batch_size": 2},
+    ]
+    assert [warning["code"] for warning in loader.warnings] == ["batch_size_capped"]
+    assert loader.jobs_billed == 10
+    assert loader.last_cursor == "10:2"
+
+
+def test_smaller_pages_still_stop_at_the_last_whole_page_under_the_budget() -> None:
+    api = feed(total=100)
+    loader = JoboFeedLoader(max_jobs=7, cursor="0:3", **api.kwargs)
+
+    assert len(loader.load()) == 6
+    assert api.bodies == [
+        {"cursor": "0:3", "batch_size": 7},
+        {"cursor": "3:3", "batch_size": 3},
+    ]
+    assert loader.has_more is True
+
+
+def test_a_short_page_is_planned_with_and_asked_for() -> None:
+    """Asking for the size the scan served keeps every page inside the room."""
+
+    def page(first: int, next_cursor: str) -> dict[str, Any]:
+        jobs = [make_job(first), make_job(first + 1)]
+        return {"jobs": jobs, "next_cursor": next_cursor, "has_more": True}
+
+    pages = iter([page(0, "c1"), page(2, "c2")])
+    api = MockJobo(lambda _: httpx.Response(200, json=next(pages)))
+    loader = JoboFeedLoader(max_jobs=5, cursor="c0", **api.kwargs)
+
+    assert len(loader.load()) == 4
+    assert api.bodies == [
+        {"cursor": "c0", "batch_size": 5},
+        {"cursor": "c1", "batch_size": 2},
+    ]
+    assert loader.last_cursor == "c2"
+
+
 def test_unbounded_resume_sends_the_cursor_alone() -> None:
     api = feed(total=30)
     loader = JoboFeedLoader(max_jobs=None, cursor="10:10", **api.kwargs)
@@ -599,6 +676,21 @@ async def test_async_resume_and_errors() -> None:
     assert len(failing.requests) == 1
 
 
+async def test_async_resume_with_smaller_pages_is_read_to_the_budget() -> None:
+    api = feed(total=100)
+    loader = JoboFeedLoader(max_jobs=6, cursor="0:2", **api.kwargs)
+
+    documents = [doc async for doc in loader.alazy_load()]
+
+    assert len(documents) == 6
+    assert api.bodies == [
+        {"cursor": "0:2", "batch_size": 6},
+        {"cursor": "2:2", "batch_size": 2},
+        {"cursor": "4:2", "batch_size": 2},
+    ]
+    assert loader.last_cursor == "6:2"
+
+
 # --------------------------------------------------------------- expired jobs
 
 
@@ -687,17 +779,53 @@ def test_expired_batch_size_is_bounded_by_the_api(batch_size: Any) -> None:
     assert api.requests == []
 
 
-def test_expired_since_too_far_back_is_the_apis_typed_error() -> None:
+def test_expired_since_older_than_seven_days_is_moved_forward_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The API answers 400 beyond 7 days, so a late weekly sync would fail."""
+    api = MockJobo(FakeExpired(total=3))
+    loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
+
+    with caplog.at_level(logging.WARNING, logger="langchain_jobo"):
+        ids = loader.expired_job_ids(datetime(2026, 11, 1), batch_size=2)
+
+    assert ids == ["expired-0", "expired-1", "expired-2"]
+    # Seven days before NOW, plus a margin, and the same value on every page.
+    assert [request.url.params["expired_since"] for request in api.requests] == [
+        "2026-11-14T12:10:00Z",
+        "2026-11-14T12:10:00Z",
+    ]
+    assert caplog.messages == [
+        "Jobo expired jobs: expired_since 2026-11-01T00:00:00Z is further back "
+        "than the 7 days the API keeps; reading from 2026-11-14T12:10:00Z "
+        "instead. Jobs that closed before then are not listed."
+    ]
+
+
+def test_expired_since_inside_the_seven_days_is_sent_as_it_is(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api = MockJobo(FakeExpired(total=1))
+    loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
+
+    with caplog.at_level(logging.WARNING, logger="langchain_jobo"):
+        loader.expired_job_ids(datetime(2026, 11, 14, 12, 30))
+
+    assert api.last.url.params["expired_since"] == "2026-11-14T12:30:00Z"
+    assert caplog.messages == []
+
+
+def test_an_expired_since_the_api_refuses_is_its_typed_error() -> None:
     problem = {
         "title": "Invalid expired_since",
         "status": 400,
-        "detail": "expired_since cannot be more than 7 days in the past.",
+        "detail": "expired_since cannot be in the future.",
     }
     api = MockJobo(reply(400, problem))
     loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
 
-    with pytest.raises(JoboValidationError, match="more than 7 days in the past"):
-        loader.expired_job_ids(datetime(2020, 1, 1))
+    with pytest.raises(JoboValidationError, match="cannot be in the future"):
+        loader.expired_job_ids(datetime(2026, 11, 22))
 
 
 def test_an_expired_cursor_that_stops_advancing_does_not_loop_forever() -> None:
@@ -725,6 +853,100 @@ async def test_expired_job_ids_async() -> None:
     assert len(api.requests) == 4
     with pytest.raises(ValueError, match="batch_size"):
         await loader.aexpired_job_ids(batch_size=0)
+
+
+async def test_expired_since_is_moved_forward_on_the_async_path_too() -> None:
+    api = MockJobo(FakeExpired(total=1))
+    loader = JoboFeedLoader(max_jobs=1, **api.kwargs)
+
+    await loader.aexpired_job_ids(datetime(2026, 1, 1))
+
+    assert api.last.url.params["expired_since"] == "2026-11-14T12:10:00Z"
+
+
+def test_expired_ids_need_no_loader() -> None:
+    api = MockJobo(FakeExpired(total=3))
+
+    ids = iter_expired_job_ids(
+        datetime(2026, 11, 20),
+        api_key=TEST_KEY,
+        batch_size=2,
+        http_client=api.client,
+    )
+
+    assert api.requests == []  # nothing is sent before the first id is asked for
+    assert list(ids) == ["expired-0", "expired-1", "expired-2"]
+    assert [dict(request.url.params) for request in api.requests] == [
+        {"batch_size": "2", "expired_since": "2026-11-20T00:00:00Z"},
+        {"batch_size": "2", "expired_since": "2026-11-20T00:00:00Z", "cursor": "2"},
+    ]
+    assert api.last.headers["X-Api-Key"] == TEST_KEY
+    assert api.last.headers["X-Jobo-Client"] == "langchain"
+    assert api.last.extensions["timeout"]["read"] == 30.0
+    assert not api.client.is_closed
+
+
+def test_expired_ids_without_a_loader_read_the_key_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JOBO_API_KEY", "jbe_live_from-env")
+    api = MockJobo(FakeExpired(total=1))
+
+    assert list(iter_expired_job_ids(http_client=api.client)) == ["expired-0"]
+    assert api.last.headers["X-Api-Key"] == "jbe_live_from-env"
+
+
+def test_expired_ids_without_a_loader_check_their_arguments_first() -> None:
+    with pytest.raises(JoboConfigurationError, match="JOBO_API_KEY"):
+        iter_expired_job_ids()
+    with pytest.raises(
+        JoboConfigurationError, match="iter_expired_job_ids needs a live API key"
+    ):
+        iter_expired_job_ids(api_key=SANDBOX_KEY)
+    with pytest.raises(
+        JoboConfigurationError, match="aiter_expired_job_ids needs a live API key"
+    ):
+        aiter_expired_job_ids(api_key=SANDBOX_KEY)
+    with pytest.raises(ValueError, match="batch_size must be between 1 and 10000"):
+        iter_expired_job_ids(api_key=TEST_KEY, batch_size=0)
+    with pytest.raises(ValueError, match="batch_size must be between 1 and 10000"):
+        aiter_expired_job_ids(api_key=TEST_KEY, batch_size=10_001)
+
+
+def test_expired_ids_without_a_loader_close_the_connection_they_opened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    made: list[httpx.Client] = []
+    real = httpx.Client
+
+    def make() -> httpx.Client:
+        made.append(real(transport=httpx.MockTransport(FakeExpired(total=3))))
+        return made[-1]
+
+    monkeypatch.setattr(httpx, "Client", make)
+
+    assert len(list(iter_expired_job_ids(api_key=TEST_KEY, batch_size=2))) == 3
+    assert len(made) == 1  # both pages went over one connection pool
+    assert made[0].is_closed
+
+
+async def test_expired_ids_without_a_loader_async() -> None:
+    api = MockJobo(FakeExpired(total=3))
+
+    ids = [
+        job_id
+        async for job_id in aiter_expired_job_ids(
+            datetime(2026, 1, 1),
+            api_key=TEST_KEY,
+            batch_size=2,
+            http_async_client=api.async_client,
+        )
+    ]
+
+    assert ids == ["expired-0", "expired-1", "expired-2"]
+    assert len(api.requests) == 2
+    assert api.last.url.params["expired_since"] == "2026-11-14T12:10:00Z"
+    assert not api.async_client.is_closed
 
 
 # ---------------------------------------------------------------- connections

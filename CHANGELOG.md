@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.1
+
+### Added
+
+- **`iter_expired_job_ids()`** and **`aiter_expired_job_ids()`**: the ids of closed jobs from the free
+  `GET /api/jobs/expired`, without a `JoboFeedLoader`. They take the key and connection settings and close
+  the connection they open. The loader's `expired_job_ids()` methods share their code.
+
+### Fixed
+
+- **The feed loader no longer stops early on a scan that serves smaller pages.** A cursor keeps the
+  smallest batch size its scan has used, so after a resume with a small `batch_size`, a later run with a
+  large `max_jobs` got small pages, saw less room than one planned batch and stopped after the first page.
+  When a page comes back shorter than asked for while the feed has more (the API warns
+  `batch_size_capped`), the loader now plans with the scan's size, asks for that size, and keeps going while
+  a whole page fits under `max_jobs`.
+- **Search is not replayed after a `500`.** `POST /api/jobs/search` bills every job it returns and takes
+  the charge before it builds the response, so a `500` can follow a charge and a retry billed the jobs
+  again. Search now retries only `429` and a `503` with `Retry-After`.
+- **A `503` without `Retry-After` is not retried**, on any request. The API sends it when a search ran out
+  of time, which fails the same way again and held a search thread on the server each time.
+- **`expired_since` older than 7 days is moved forward instead of failing.** The API answers `400` beyond
+  7 days, so the README's `drop_closed_jobs(last_sync)` recipe failed whenever a weekly sync ran late. The
+  value is now moved to just under 7 days ago, with a warning on the `langchain_jobo` logger: jobs that
+  closed before then are not listed.
+- **Search asks for no facets** (`include_facets: []`). Nothing reads them, and the API computed its
+  default facets on every search.
+
+### Changed
+
+- The `language` filter's description says that names such as `English` work as well as ISO 639-1 codes,
+  and the contract drift test checks that every language code of the shared contract is accepted.
+- The README says that `JoboRetriever` sends its query as keywords, not as a question to turn into
+  filters, and uses `iter_expired_job_ids()` in the closed-jobs recipe.
+
 ## 0.1.0
 
 First release: the Jobo jobs API as LangChain components.

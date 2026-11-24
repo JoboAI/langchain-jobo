@@ -9,7 +9,9 @@ Internal. It owns the things every component needs to get right:
 - connections: one `httpx.Client` and one `httpx.AsyncClient` per event loop
   are kept and reused, and closed by `close()` / `aclose()`;
 - retries: only `429`, `500` and `503` (and failures to connect) are retried,
-  `Retry-After` is honoured, and `402` / `409` are never retried;
+  `Retry-After` is honoured, and `402` / `409` are never retried. A `503`
+  without `Retry-After` is not retried, and neither is a `500` on the billed
+  search;
 - errors: every non-2xx response is raised as a typed `JoboAPIError`.
 """
 
@@ -69,6 +71,12 @@ MISSING_KEY_MESSAGE = (
 )
 
 _RETRYABLE_STATUSES = frozenset({429, 500, 503})
+#: `POST /api/jobs/search` bills every job it returns, every time, and takes
+#: the charge before it builds the response: a `500` can follow a charge, and
+#: a replay would charge again. Only a refusal that comes before any work is
+#: retried there.
+_BILLED_RETRYABLE_STATUSES = frozenset({429, 503})
+_BILLED_SEARCH_PATH = "/api/jobs/search"
 _BACKOFF_CAP_SECONDS = 30.0
 
 
@@ -250,10 +258,11 @@ class JoboClient:
     ) -> JoboResponse:
         """Send a request, retrying only what the API documents as retryable."""
         kwargs = self._request_kwargs(method, path, params, json, timeout)
+        billed = _is_billed(method, path)
         attempt = 0
         while True:
             try:
-                return self._attempt(kwargs)
+                return self._attempt(kwargs, billed=billed)
             except _AttemptError as failure:
                 delay = self._retry_delay(failure, attempt)
                 if delay is None:
@@ -261,12 +270,12 @@ class JoboClient:
                 self._sleep(delay)
                 attempt += 1
 
-    def _attempt(self, kwargs: dict[str, Any]) -> JoboResponse:
+    def _attempt(self, kwargs: dict[str, Any], *, billed: bool) -> JoboResponse:
         try:
             response = self._sync_client().request(**kwargs)
         except httpx.TransportError as exc:
             raise _transport_failure(exc) from exc
-        return _handle_response(response)
+        return _handle_response(response, billed=billed)
 
     def _sync_client(self) -> httpx.Client:
         if self._http_client is not None:
@@ -311,6 +320,7 @@ class JoboClient:
     ) -> JoboResponse:
         """Async twin of `request`."""
         kwargs = self._request_kwargs(method, path, params, json, timeout)
+        billed = _is_billed(method, path)
         client = self._async_client()
         attempt = 0
         while True:
@@ -319,7 +329,7 @@ class JoboClient:
                     response = await client.request(**kwargs)
                 except httpx.TransportError as exc:
                     raise _transport_failure(exc) from exc
-                return _handle_response(response)
+                return _handle_response(response, billed=billed)
             except _AttemptError as failure:
                 delay = self._retry_delay(failure, attempt)
                 if delay is None:
@@ -420,7 +430,22 @@ def _transport_failure(exc: httpx.TransportError) -> _AttemptError:
     return _AttemptError(error, retryable=retryable)
 
 
-def _handle_response(response: httpx.Response) -> JoboResponse:
+def _is_billed(method: str, path: str) -> bool:
+    """Whether the request is a search, which bills every job it returns."""
+    return method.upper() == "POST" and path == _BILLED_SEARCH_PATH
+
+
+def _is_retryable(error: JoboAPIError, *, billed: bool) -> bool:
+    status = error.status_code
+    if status not in (_BILLED_RETRYABLE_STATUSES if billed else _RETRYABLE_STATUSES):
+        return False
+    # The API sends `Retry-After` with a 503 it expects to pass ("unavailable").
+    # A 503 without it, such as "Search took too long", fails the same way
+    # again, and each replay holds a search thread on the server.
+    return status != 503 or error.retry_after is not None
+
+
+def _handle_response(response: httpx.Response, *, billed: bool) -> JoboResponse:
     if response.is_success:
         try:
             data = response.json()
@@ -433,9 +458,7 @@ def _handle_response(response: httpx.Response) -> JoboResponse:
         return JoboResponse(data=data, usage=_parse_usage(response.headers))
 
     api_error = _error_from_response(response)
-    raise _AttemptError(
-        api_error, retryable=response.status_code in _RETRYABLE_STATUSES
-    )
+    raise _AttemptError(api_error, retryable=_is_retryable(api_error, billed=billed))
 
 
 def _parse_usage(headers: Mapping[str, str]) -> JoboUsage:

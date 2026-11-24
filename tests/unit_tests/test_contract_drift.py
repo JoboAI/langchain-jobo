@@ -191,6 +191,26 @@ def test_search_filter_options_match_the_typed_fields() -> None:
         assert list(get_args(literal)) == by_key[key]["options"], key
 
 
+def test_language_accepts_every_option_of_the_contract() -> None:
+    """`language` stays open (the API takes names such as "English" too).
+
+    It is not a closed enum here, so check that every code the contract lists
+    is accepted and sent as it is.
+    """
+    options: list[str] = next(
+        descriptor["options"]
+        for descriptor in search_filters()
+        if descriptor["key"] == "language"
+    )
+
+    assert options == contract()["enums"]["languages"]
+    filters = JoboSearchFilters.model_validate({"language": options})
+    assert filters.language == options
+    assert build_search_body(filters)["languages"] == options
+    args = JoboSearchInput.model_validate({"language": options})
+    assert args.language == options
+
+
 def test_company_category_fields_reject_values_outside_the_contract() -> None:
     values = contract()["enums"]["company_categories"]
 

@@ -105,6 +105,7 @@ def test_search_maps_arguments_onto_the_post_body(search_api: MockJobo) -> None:
             "sort": "discovered_desc",
             "page": 2,
             "page_size": 10,
+            "include_facets": [],
         }
     ]
 
@@ -112,7 +113,9 @@ def test_search_maps_arguments_onto_the_post_body(search_api: MockJobo) -> None:
 def test_search_defaults_to_a_small_page(search_api: MockJobo) -> None:
     JoboSearchTool(**search_api.kwargs).invoke({"query": "nurse"})
 
-    assert search_api.bodies == [{"queries": ["nurse"], "page": 1, "page_size": 5}]
+    assert search_api.bodies == [
+        {"queries": ["nurse"], "page": 1, "page_size": 5, "include_facets": []}
+    ]
 
 
 def test_search_page_size_is_capped(search_api: MockJobo) -> None:
@@ -207,7 +210,9 @@ def test_a_custom_search_schema_is_left_alone(search_api: MockJobo) -> None:
 
     assert tool.args_schema is QueryOnly
     assert list(tool.args) == ["query"]
-    assert search_api.bodies == [{"queries": ["nurse"], "page": 1, "page_size": 3}]
+    assert search_api.bodies == [
+        {"queries": ["nurse"], "page": 1, "page_size": 3, "include_facets": []}
+    ]
 
 
 def test_search_schema_leads_with_the_query() -> None:
@@ -296,6 +301,7 @@ def test_search_company_categories_are_a_closed_set(search_api: MockJobo) -> Non
             "company_categories": {"include": ["saas"], "exclude": ["agency"]},
             "page": 1,
             "page_size": 5,
+            "include_facets": [],
         }
     ]
 
@@ -389,6 +395,7 @@ async def test_search_async(search_api: MockJobo) -> None:
             "industries": {"exclude": ["Staffing"]},
             "page": 1,
             "page_size": 5,
+            "include_facets": [],
         }
     ]
     assert len(message.artifact["jobs"]) == 5

@@ -5,7 +5,11 @@ tracking systems, as LangChain tools, a retriever and a document loader.
 """
 
 from langchain_jobo._version import __version__
-from langchain_jobo.document_loaders import JoboFeedLoader
+from langchain_jobo.document_loaders import (
+    JoboFeedLoader,
+    aiter_expired_job_ids,
+    iter_expired_job_ids,
+)
 from langchain_jobo.errors import (
     JoboAPIError,
     JoboAuthenticationError,
@@ -103,5 +107,7 @@ __all__ = [
     "SearchSort",
     "WorkModel",
     "__version__",
+    "aiter_expired_job_ids",
     "get_jobo_tools",
+    "iter_expired_job_ids",
 ]

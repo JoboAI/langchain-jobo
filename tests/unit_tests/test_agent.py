@@ -74,6 +74,7 @@ def test_agent_searches_and_cites_a_job(search_api: MockJobo) -> None:
             "work_models": ["remote"],
             "page": 1,
             "page_size": 2,
+            "include_facets": [],
         }
     ]
     tool_messages = [m for m in result["messages"] if isinstance(m, ToolMessage)]

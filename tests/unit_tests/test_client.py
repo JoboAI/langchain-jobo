@@ -396,6 +396,51 @@ def test_500_backs_off_exponentially_and_gives_up_after_max_retries() -> None:
     assert len(api.requests) == 3
 
 
+def test_500_on_the_billed_search_is_not_replayed() -> None:
+    """Search takes its charge before it builds the answer: a replay bills twice."""
+    client, api, sleeps = build(reply(500, {"message": "An error occurred"}))
+
+    with pytest.raises(JoboServerError) as caught:
+        client.request("POST", "/api/jobs/search", json={"page_size": 5})
+
+    assert caught.value.status_code == 500
+    assert len(api.requests) == 1
+    assert sleeps == []
+
+
+def test_503_with_retry_after_on_the_billed_search_is_retried() -> None:
+    busy = reply(503, {"title": "Search unavailable"}, headers={"Retry-After": "5"})
+    client, api, sleeps = build(sequence(busy, ok))
+
+    response = client.request("POST", "/api/jobs/search", json={"page_size": 5})
+
+    assert response.data == {"ok": True}
+    assert sleeps == [5.0]
+    assert api.bodies == [{"page_size": 5}] * 2
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/api/jobs/search"),
+        ("POST", "/api/jobs/feed"),
+        ("GET", "/api/jobs/x"),
+    ],
+)
+def test_503_without_retry_after_is_not_retried(method: str, path: str) -> None:
+    """A "Search took too long" 503 fails the same way again: no Retry-After."""
+    too_long = reply(503, {"title": "Search took too long"})
+    client, api, sleeps = build(too_long)
+
+    with pytest.raises(JoboServerError) as caught:
+        client.request(method, path, json={} if method == "POST" else None)
+
+    assert caught.value.status_code == 503
+    assert caught.value.retry_after is None
+    assert len(api.requests) == 1
+    assert sleeps == []
+
+
 def test_max_retries_zero_never_retries() -> None:
     limited = reply(429, RATE_LIMITED, headers={"Retry-After": "1"})
     client, api, sleeps = build(limited, max_retries=0)
@@ -532,6 +577,23 @@ async def test_async_500_gives_up_after_max_retries() -> None:
 
     assert sleeps == [1.0, 2.0]
     assert len(api.requests) == 3
+
+
+async def test_async_billed_search_retries_only_before_the_charge() -> None:
+    failed = reply(500, {"message": "boom"})
+    too_long = reply(503, {"title": "Search took too long"})
+    busy = reply(503, {"title": "Search unavailable"}, headers={"Retry-After": "5"})
+    client, api, sleeps = build(sequence(failed, too_long, busy, ok))
+
+    with pytest.raises(JoboServerError, match="500"):
+        await client.arequest("POST", "/api/jobs/search", json={})
+    with pytest.raises(JoboServerError, match="503"):
+        await client.arequest("POST", "/api/jobs/search", json={})
+    response = await client.arequest("POST", "/api/jobs/search", json={})
+
+    assert response.data == {"ok": True}
+    assert sleeps == [5.0]
+    assert len(api.requests) == 4
 
 
 # ---------------------------------------------------------------- connections

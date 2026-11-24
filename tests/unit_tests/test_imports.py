@@ -13,7 +13,9 @@ COMPONENTS = [
     "JoboRetriever",
     "JoboSearchInput",
     "JoboSearchTool",
+    "aiter_expired_job_ids",
     "get_jobo_tools",
+    "iter_expired_job_ids",
 ]
 
 ERRORS = [
@@ -94,4 +96,4 @@ def test_every_filter_model_has_a_dict_spelling() -> None:
 
 
 def test_version_is_a_release_string() -> None:
-    assert langchain_jobo.__version__ == "0.1.0"
+    assert langchain_jobo.__version__ == "0.1.1"

@@ -140,8 +140,10 @@ class JoboRetriever(BaseRetriever, JoboSettings):
                 `page_content`. Defaults to true.
             base_url: API base URL. Defaults to `https://connect.jobo.world`.
             timeout: Response timeout in seconds. Defaults to 30.
-            max_retries: Retries after the first attempt, for 429, 500 and 503
-                responses and failures to connect. Defaults to 2.
+            max_retries: Retries after the first attempt, for 429 responses,
+                503 responses with `Retry-After` and failures to connect. A
+                500 is not retried: search may have billed before it failed.
+                Defaults to 2.
             http_client: Optional `httpx.Client` to send sync requests with.
             http_async_client: Optional `httpx.AsyncClient` for async requests.
             **kwargs: Other fields of LangChain's `BaseRetriever`, e.g. `tags`
@@ -195,7 +197,10 @@ class JoboRetriever(BaseRetriever, JoboSettings):
             raise ValueError(msg)
 
         filters = merge_search_filters(self.filters, call.get("filters"))
-        return build_search_body(filters, query=query, page=page, page_size=size)
+        body = build_search_body(filters, query=query, page=page, page_size=size)
+        # Documents carry no facets: do not have the API compute them.
+        body["include_facets"] = []
+        return body
 
     def _documents(self, response: JoboResponse) -> list[Document]:
         payload = response.data if isinstance(response.data, dict) else {}

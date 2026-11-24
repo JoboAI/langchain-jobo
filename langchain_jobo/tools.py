@@ -218,8 +218,10 @@ class JoboSearchTool(_JoboTool):
                 `enhanced_html`.
             base_url: API base URL. Defaults to `https://connect.jobo.world`.
             timeout: Response timeout in seconds. Defaults to 30.
-            max_retries: Retries after the first attempt, for 429, 500 and 503
-                responses and failures to connect. Defaults to 2.
+            max_retries: Retries after the first attempt, for 429 responses,
+                503 responses with `Retry-After` and failures to connect. A
+                500 is not retried: search may have billed before it failed.
+                Defaults to 2.
             http_client: Optional `httpx.Client` to send sync requests with.
             http_async_client: Optional `httpx.AsyncClient` for async requests.
             **kwargs: Other fields of LangChain's `BaseTool`, e.g.
@@ -259,6 +261,8 @@ class JoboSearchTool(_JoboTool):
             page_size=page_size,
             description_format=self.description_format,
         )
+        # Facets are left out of the answer: do not have the API compute them.
+        body["include_facets"] = []
         return body, capped
 
     @staticmethod

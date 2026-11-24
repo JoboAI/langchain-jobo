@@ -267,7 +267,10 @@ class SearchFilterFields(BaseModel):
     )
     language: StrList = Field(
         default=None,
-        description='Description languages as ISO 639-1 codes, e.g. "en", "de".',
+        description=(
+            'Description languages as ISO 639-1 codes, e.g. "en", "de". Names '
+            'such as "English" also work.'
+        ),
     )
     skills: StrList = Field(
         default=None,

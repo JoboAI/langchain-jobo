@@ -25,6 +25,8 @@ from tests.unit_tests.helpers import (
 )
 from tests.unit_tests.helpers import search_handler as search_api_handler
 
+BODY_KEYS_THAT_ARE_NOT_FILTERS = ("queries", "page", "page_size", "include_facets")
+
 
 def test_query_and_constructor_filters_build_the_search_body(
     search_api: MockJobo,
@@ -52,6 +54,7 @@ def test_query_and_constructor_filters_build_the_search_body(
             "salary_usd": {"min": 90000},
             "page": 1,
             "page_size": 3,
+            "include_facets": [],
         }
     ]
 
@@ -159,6 +162,7 @@ async def test_async_retrieval(search_api: MockJobo) -> None:
         "experience_levels": ["senior"],
         "page": 1,
         "page_size": 4,
+        "include_facets": [],
     }
     assert search_api.last.headers["X-Jobo-Client"] == "langchain"
 
@@ -187,7 +191,7 @@ def test_filters_can_be_overridden_per_call(search_api: MockJobo) -> None:
     retriever.invoke("nurse")
 
     assert [
-        {k: v for k, v in body.items() if k not in ("queries", "page", "page_size")}
+        {k: v for k, v in body.items() if k not in BODY_KEYS_THAT_ARE_NOT_FILTERS}
         for body in search_api.bodies
     ] == [
         {"locations": ["Berlin", "Paris"], "work_models": ["remote"]},
@@ -257,6 +261,7 @@ async def test_per_call_options_async(search_api: MockJobo) -> None:
             "work_models": ["remote"],
             "page": 4,
             "page_size": 2,
+            "include_facets": [],
         }
     ]
     with pytest.raises(TypeError, match="unexpected arguments: K"):

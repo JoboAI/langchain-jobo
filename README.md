@@ -13,6 +13,7 @@ loader.
 | `JoboLocationSearchTool` (`jobo_location_search`) | A place name to the locations the search takes | `GET /api/connectors/locations/suggest` | Free |
 | `JoboRetriever` | Query to job `Document`s | `POST /api/jobs/search` | Per job returned |
 | `JoboFeedLoader` | Stream the job feed as `Document`s, and list closed jobs | `POST /api/jobs/feed`, `GET /api/jobs/expired` | Per new job; closed-job ids are free |
+| `iter_expired_job_ids()` | The ids of closed jobs, without a loader | `GET /api/jobs/expired` | Free |
 | `get_jobo_tools()` | The five tools in one call | | |
 
 Read [Cost](#cost) before pointing an agent at it.
@@ -50,7 +51,7 @@ serves job search and job lookups, and nothing else this package calls:
 | --- | --- |
 | `JoboSearchTool`, `JoboJobDetailsTool`, `JoboRetriever` | Work |
 | `JoboCompanySearchTool`, `JoboFilterValuesTool`, `JoboLocationSearchTool` | The sandbox answers `404 not_available_in_sandbox`. The tool does not raise: it tells the model the lookup is unavailable and what to do instead, so an agent run carries on |
-| `JoboFeedLoader` | Refused when it is built, with `JoboConfigurationError` |
+| `JoboFeedLoader`, `iter_expired_job_ids()` | Refused when it is built or called, with `JoboConfigurationError` |
 
 So `get_jobo_tools()` is safe to use with a sandbox key. `get_jobo_tools(include_lookups=False)` leaves the
 three lookups out. See the [sandbox docs](https://jobo.world/docs/sandbox).
@@ -119,6 +120,7 @@ Arguments, in the order the model is shown them: `query`, `location`, `sources`,
   `occupation_ids`, `companies`) match only values the index holds. Their descriptions point the model at
   `jobo_filter_values` and `jobo_company_search`, which look the values up for free.
 - **`location`** is one place or a list of places; a list matches jobs in any of them.
+- **`language`** takes ISO 639-1 codes (`en`, `de`). Names such as `English` also work.
 - **List arguments take a list.** A single string is also accepted, because models send one. For ids,
   codes, fixed values and skills it is split on commas. For names (`companies`, `industries`,
   `job_categories`, `job_subcategories` and their `exclude_` twins) it is one value, never split:
@@ -289,6 +291,10 @@ for doc in retriever.invoke("staff data engineer"):
     print(doc.metadata["title"], "-", doc.metadata["company"], doc.metadata["source"])
 ```
 
+- **The query is sent as keywords.** It is matched as words against job titles, companies, skills and
+  summaries, not read as a question: `"remote senior nursing jobs in Ohio paying over $90k"` looks for those
+  words, and is not turned into filters. Pass the keywords (`"registered nurse"`) as the query and put the
+  rest in `filters=`, or give an agent `JoboSearchTool`, where the model fills in the filters itself.
 - `filters` takes the same filter names as the search tool, plus `description_format`, and applies them to
   every query. Pass a `JoboSearchFilters`, or the same keys as a dict: `filters={"location": "London"}`.
   Both are checked when the retriever is built, and unknown names are rejected. See [Typing](#typing).
@@ -372,7 +378,10 @@ a live key: a sandbox key is refused when the loader is built.
   ```
 
   A cursor keeps the filters of the scan it came from, so `filters` are ignored when `cursor` is given. Use
-  the same `max_jobs` and `batch_size` on every run of one scan to keep its batch size steady.
+  the same `max_jobs` and `batch_size` on every run of one scan to keep its batch size steady. A cursor
+  also keeps the smallest batch size its scan has used: when a resumed scan serves smaller pages than this
+  run planned (the API warns `batch_size_capped`), the loader reads pages of the scan's size, as many as fit
+  under `max_jobs`.
 - **When the cursor moves.** `last_cursor` advances once every job of a batch has been yielded. If you stop
   iterating part-way through a batch, it still points at the start of that batch: resuming re-delivers the
   batch, and the feed does not bill again for jobs you received in the last 30 days. Dedupe on
@@ -396,29 +405,36 @@ Use the retriever or the search tool to answer a question. Use the loader to cop
 
 ### Dropping closed jobs from your index
 
-An index built from the feed keeps jobs that have since closed. `expired_job_ids()` returns the ids of jobs
-that expired, from the free `GET /api/jobs/expired`. They are the `Document.id`s the loader yields, so they
-can go straight to a vector store's `delete`:
+An index built from the feed keeps jobs that have since closed. `iter_expired_job_ids()` yields the ids of
+jobs that expired, from the free `GET /api/jobs/expired`. They are the `Document.id`s the loader yields, so
+they can go straight to a vector store's `delete`. It needs a live key, and no loader:
 
 ```python
 from datetime import datetime
 
 from langchain_core.vectorstores import VectorStore
-from langchain_jobo import JoboFeedLoader
+from langchain_jobo import iter_expired_job_ids
 
 
 def drop_closed_jobs(vector_store: VectorStore, last_sync: datetime) -> int:
     """Delete the jobs that closed since `last_sync` from the index."""
-    loader = JoboFeedLoader(max_jobs=1)  # max_jobs does not apply to expired ids
-    closed = loader.expired_job_ids(expired_since=last_sync)
+    closed = list(iter_expired_job_ids(expired_since=last_sync))
     if closed:
         vector_store.delete(ids=closed)
     return len(closed)
 ```
 
-`expired_since` goes back 7 days at most, and defaults to the last 24 hours. `lazy_expired_job_ids()`
-yields the ids a page at a time, and `aexpired_job_ids()` / `alazy_expired_job_ids()` are the async
-equivalents. The call is never billed and is not counted against `max_jobs`.
+`iter_expired_job_ids()` takes `api_key`, `batch_size` (1-10,000 ids per request), `base_url`, `timeout`,
+`max_retries` and `http_client`, and closes the connection it opened once the ids run out.
+`aiter_expired_job_ids()` is the async equivalent (`async for`, with `http_async_client`). A loader you
+already have does the same over its own connection: `loader.expired_job_ids()`, `lazy_expired_job_ids()`,
+`aexpired_job_ids()` and `alazy_expired_job_ids()`. The call is never billed and is not counted against
+`max_jobs`.
+
+`expired_since` defaults to the last 24 hours, and the API goes back 7 days at most. An older value, from a
+weekly sync that ran late for example, is moved forward to just under 7 days ago instead of failing, and a
+warning is logged on the `langchain_jobo` logger: jobs that closed before then are not listed. Sync at
+least once a week, or rebuild the index, if every closed job must go.
 
 ## Typing
 
@@ -472,7 +488,8 @@ What this package does about it:
 - The search tool asks for 5 jobs by default and caps every call at `max_page_size`.
 - The retriever returns `k` jobs (default 5).
 - The feed loader will not run without an explicit `max_jobs`.
-- `402` is never retried. Neither is a read timeout: a page may already have been delivered.
+- `402` is never retried. Neither is a read timeout, nor a `500` on search: a page may already have been
+  delivered and billed.
 - Search tool artifacts carry the `usage` the API reported for the call.
 
 An agent that searches in a loop spends per job returned on every call, so keep `max_page_size` low and
@@ -486,10 +503,18 @@ exponentially. A `Retry-After` longer than 60 seconds is not slept through: the 
 `retry_after` set.
 
 `402` (insufficient credits) and `409` (for example `feed_cursor_restart_required`) are never retried.
+Neither are:
+
+- a `503` without `Retry-After`. The API sends one when a search ran out of time ("Search took too long"),
+  which fails the same way again;
+- a `500` on search (`JoboSearchTool`, `JoboRetriever`). Search takes its charge before it builds the
+  response, so a `500` can follow a charge and a replay would bill the jobs again. Search retries only `429`
+  and a `503` with `Retry-After`, which come before any work. A feed request is safe to replay, because a
+  job delivered again is free.
 
 | Exception | Status | Notes |
 | --- | --- | --- |
-| `JoboConfigurationError` | | Raised when a component is built: no API key, or a sandbox key given to `JoboFeedLoader` |
+| `JoboConfigurationError` | | Raised when a component is built: no API key, or a sandbox key given to `JoboFeedLoader` or `iter_expired_job_ids()` |
 | `JoboValidationError` | 400 | `errors` holds the API's per-field messages, which are also in the exception message. Includes `invalid_cursor` on the feed |
 | `JoboAuthenticationError` | 401 | Missing, invalid or expired key |
 | `JoboInsufficientCreditsError` | 402 | `credits_required`, `credits_balance`, `top_up_url`, `upgrade_url` |

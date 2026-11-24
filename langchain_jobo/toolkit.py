@@ -63,7 +63,8 @@ def get_jobo_tools(
         base_url: API base URL.
         timeout: Response timeout in seconds.
         max_retries: Retries after the first attempt, for 429, 500 and 503
-            responses and failures to connect.
+            responses and failures to connect. A 503 without `Retry-After` is
+            not retried, nor is a 500 on the billed search.
         http_client: Optional `httpx.Client` to send sync requests with.
         http_async_client: Optional `httpx.AsyncClient` for async requests.
 
