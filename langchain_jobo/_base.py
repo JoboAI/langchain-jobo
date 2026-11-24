@@ -69,7 +69,8 @@ class JoboSettings(BaseModel):
         description=(
             "Retries after the first attempt, for 429, 500 and 503 responses and "
             "failures to connect. 402 and 409 are never retried, nor is a 503 "
-            "without Retry-After or a 500 on the billed search."
+            "without Retry-After or a 500 on a billed read (search, hiring "
+            "signals)."
         ),
     )
     http_client: httpx.Client | None = Field(

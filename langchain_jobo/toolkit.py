@@ -17,8 +17,10 @@ from langchain_jobo._client import (
 )
 from langchain_jobo.tools import (
     DEFAULT_MAX_PAGE_SIZE,
+    DEFAULT_MAX_SIGNALS,
     JoboCompanySearchTool,
     JoboFilterValuesTool,
+    JoboHiringSignalsTool,
     JoboJobDetailsTool,
     JoboLocationSearchTool,
     JoboSearchTool,
@@ -31,6 +33,8 @@ def get_jobo_tools(
     *,
     max_page_size: int = DEFAULT_MAX_PAGE_SIZE,
     include_lookups: bool = True,
+    include_hiring_signals: bool = False,
+    max_signals: int = DEFAULT_MAX_SIGNALS,
     handle_tool_error: bool | str | Callable[[ToolException], str] = False,
     handle_validation_error: bool | str | Callable[[ValidationError], str] = False,
     base_url: str = DEFAULT_BASE_URL,
@@ -54,6 +58,13 @@ def get_jobo_tools(
             and `jobo_location_search`. The sandbox does not serve them: with
             a sandbox key they answer the model with a plain note instead of
             failing, and `include_lookups=False` leaves them out.
+        include_hiring_signals: Add `jobo_hiring_signals`, which reads hiring
+            signals: events at companies such as a hiring surge or a first
+            job in a new country. Off by default, because every signal it
+            returns is billed at ten times the price of a job, and a signal
+            read again is billed again.
+        max_signals: Hard cap on signals the hiring signals tool requests per
+            call, 1-200.
         handle_tool_error: Hand an API error (a rate limit, an empty wallet)
             back to the model as the tool's answer instead of raising
             `ToolException`. `True`, a fixed message, or a function of the
@@ -64,14 +75,16 @@ def get_jobo_tools(
         timeout: Response timeout in seconds.
         max_retries: Retries after the first attempt, for 429, 500 and 503
             responses and failures to connect. A 503 without `Retry-After` is
-            not retried, nor is a 500 on the billed search.
+            not retried, nor is a 500 on a billed read (search, hiring
+            signals).
         http_client: Optional `httpx.Client` to send sync requests with.
         http_async_client: Optional `httpx.AsyncClient` for async requests.
 
     Returns:
         `[JoboSearchTool, JoboJobDetailsTool, JoboCompanySearchTool,
         JoboFilterValuesTool, JoboLocationSearchTool]`, or the first two when
-        `include_lookups` is false.
+        `include_lookups` is false, followed by `JoboHiringSignalsTool` when
+        `include_hiring_signals` is true.
 
     Raises:
         JoboConfigurationError: No API key was passed or found.
@@ -105,6 +118,8 @@ def get_jobo_tools(
             JoboFilterValuesTool(**shared),
             JoboLocationSearchTool(**shared),
         ]
+    if include_hiring_signals:
+        tools.append(JoboHiringSignalsTool(max_signals=max_signals, **shared))
     for tool in tools[1:]:
         tool._share_connections_with(tools[0])
     return list(tools)

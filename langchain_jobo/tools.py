@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Literal
+from datetime import date
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from uuid import UUID
 
@@ -14,7 +15,16 @@ from langchain_core.callbacks import (
     CallbackManagerForToolRun,
 )
 from langchain_core.tools import BaseTool, ToolException
-from pydantic import BaseModel, Field, PrivateAttr, SecretStr, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    create_model,
+    model_validator,
+)
 
 from langchain_jobo._base import JoboSettings, given
 from langchain_jobo._client import SANDBOX_KEY_PREFIX, JoboResponse
@@ -25,9 +35,14 @@ from langchain_jobo.errors import (
 )
 from langchain_jobo.filters import (
     API_MAX_PAGE_SIZE,
+    CompanySize,
     DescriptionFormat,
     FilterFacet,
     JoboSearchInput,
+    NameList,
+    StrList,
+    _SchemaMaximum,
+    _to_enum_list,
     build_search_body,
     is_stock_search_schema,
     search_input_schema,
@@ -39,6 +54,17 @@ from langchain_jobo.formatting import (
     format_location_suggestions,
     format_occupation_matches,
     format_search_results,
+)
+from langchain_jobo.signals import (
+    NO_SIGNALS_IN_SANDBOX,
+    SIGNAL_MAX_LIMIT,
+    SignalSeniority,
+    SignalType,
+    build_signals_request,
+    format_signals,
+    signal_list,
+    signals_error_message,
+    to_signal_instant,
 )
 
 DEFAULT_MAX_PAGE_SIZE = 25
@@ -1053,15 +1079,424 @@ class JoboLocationSearchTool(_JoboTool):
         return self._finish(query.strip(), response)
 
 
+# -------------------------------------------------------------------- signals
+
+DEFAULT_MAX_SIGNALS = 25
+#: Signals the tool asks for when the model names no limit.
+DEFAULT_SIGNAL_LIMIT = 5
+
+_SignalTypeList = Annotated[list[SignalType] | None, BeforeValidator(_to_enum_list)]
+_SeniorityList = Annotated[list[SignalSeniority] | None, BeforeValidator(_to_enum_list)]
+_CompanySizeList = Annotated[list[CompanySize] | None, BeforeValidator(_to_enum_list)]
+#: Arguments of the signals tool that are not filters of the API.
+_NOT_SIGNAL_FILTERS = frozenset({"company_id", "limit", "cursor"})
+
+
+def _signal_limit_description(maximum: int) -> str:
+    return (
+        f"Signals to return, at most {maximum}. Every returned signal is billed, "
+        "at ten times the price of a job, so ask only for what you need. A "
+        "larger number is reduced to the maximum."
+    )
+
+
+class JoboHiringSignalsInput(BaseModel):
+    """Arguments of the `jobo_hiring_signals` tool.
+
+    Every filter is optional, and filters combine with AND; the values inside
+    one list combine with OR. The focus filters (`functions`, `roles`,
+    `seniority`, `technologies`, `skills`, `job_countries`) say what a signal
+    must be about. A value cannot contain a comma: the API separates values
+    with commas, so one is refused here rather than read as two.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    types: _SignalTypeList = Field(
+        default=None,
+        description=(
+            "Only these kinds of signal, e.g. hiring_surge, new_country, "
+            "leadership_hire. Leave empty for every kind."
+        ),
+    )
+    domains: StrList = Field(
+        default=None,
+        description=(
+            'Only signals at these companies, by website domain, e.g. "stripe.com". '
+            "At most 100."
+        ),
+    )
+    company_id: str | None = Field(
+        default=None,
+        description=(
+            "One company's signals, by Jobo company id (a UUID): the Company ID "
+            "shown with each signal. It takes only types, min_strength, "
+            "detected_after, detected_before, created_after, limit and cursor. "
+            "To name companies by website, use domains instead."
+        ),
+    )
+    countries: StrList = Field(
+        default=None,
+        description=(
+            "Countries the companies are headquartered in, as two-letter codes, "
+            'e.g. "US", "DE".'
+        ),
+    )
+    company_sizes: _CompanySizeList = Field(
+        default=None, description="Headcount bands of the companies."
+    )
+    industries: NameList = Field(
+        default=None,
+        description=(
+            "Industries of the companies, matched against the primary industry "
+            "and the industry list. A value cannot contain a comma."
+        ),
+    )
+    funding_stages: NameList = Field(
+        default=None,
+        description='Latest funding round of the companies, e.g. "Seed", "Series A".',
+    )
+    functions: NameList = Field(
+        default=None,
+        description=(
+            'Job categories the signal must be about, e.g. "Technology", '
+            '"Sales". A focus filter.'
+        ),
+    )
+    roles: NameList = Field(
+        default=None,
+        description=(
+            "Words or phrases to look for in the job title or occupation behind "
+            'the signal, e.g. "data engineer". At least 2 characters each. A '
+            "focus filter."
+        ),
+    )
+    seniority: _SeniorityList = Field(
+        default=None,
+        description="Seniority of the role behind the signal. A focus filter.",
+    )
+    technologies: StrList = Field(
+        default=None,
+        description=(
+            'Named tools the signal must be about, e.g. "Snowflake". A focus '
+            "filter, combined with skills."
+        ),
+    )
+    skills: StrList = Field(
+        default=None,
+        description=(
+            "Named skills the signal must be about. A focus filter, combined "
+            "with technologies."
+        ),
+    )
+    job_countries: StrList = Field(
+        default=None,
+        description=(
+            "Countries the jobs are in (not the company's headquarters), as "
+            "two-letter codes. A focus filter."
+        ),
+    )
+    min_strength: int | None = Field(
+        default=None,
+        ge=1,
+        le=100,
+        description=(
+            "Only signals at least this strong. Strength runs from 1 to 100 and "
+            "compares signals of the same type."
+        ),
+    )
+    detected_after: date | None = Field(
+        default=None,
+        description="Earliest detection day, inclusive, as yyyy-MM-dd.",
+    )
+    detected_before: date | None = Field(
+        default=None,
+        description="Latest detection day, inclusive, as yyyy-MM-dd.",
+    )
+    created_after: Annotated[str | None, BeforeValidator(to_signal_instant)] = Field(
+        default=None,
+        description=(
+            "Only signals first stored after this instant, exclusive, e.g. "
+            "2026-11-12T09:30:00Z. To ask for recent signals, detected_after is "
+            "simpler."
+        ),
+    )
+    exclude_agencies: bool | None = Field(
+        default=None,
+        description=(
+            "Leave out staffing agencies, whose postings are their clients' hiring."
+        ),
+    )
+    limit: Annotated[int, _SchemaMaximum(SIGNAL_MAX_LIMIT)] = Field(
+        default=DEFAULT_SIGNAL_LIMIT,
+        ge=1,
+        description=_signal_limit_description(SIGNAL_MAX_LIMIT),
+    )
+    cursor: str | None = Field(
+        default=None,
+        description=(
+            "The cursor a previous answer gave, to read its next page. Pass the "
+            "same other arguments with it. Leave it out for the first page."
+        ),
+    )
+
+    def filters(self) -> dict[str, Any]:
+        """The filters, keyed as the API names them. `None` means not set."""
+        return {
+            name: getattr(self, name)
+            for name in type(self).model_fields
+            if name not in _NOT_SIGNAL_FILTERS
+        }
+
+    @model_validator(mode="after")
+    def _refuse_what_the_api_would_misread(self) -> JoboHiringSignalsInput:
+        # A comma would split a value in two, and the per-company endpoint
+        # ignores the filters it does not take: both are refused here, before
+        # a request is made and billed.
+        build_signals_request(self.filters(), company_id=self.company_id)
+        return self
+
+
+_capped_signal_schemas: dict[int, type[JoboHiringSignalsInput]] = {}
+
+
+def signals_input_schema(max_signals: int) -> type[JoboHiringSignalsInput]:
+    """`JoboHiringSignalsInput` as a tool capped at `max_signals` shows it.
+
+    The schema states the tool's cap as `limit`'s maximum and keeps the
+    default under it. A larger `limit` still validates: the tool reduces it
+    and says so, rather than failing the model's call.
+
+    One class is made per cap and reused.
+    """
+    schema = _capped_signal_schemas.get(max_signals)
+    if schema is None:
+        schema = create_model(
+            "JoboHiringSignalsInput",
+            __base__=JoboHiringSignalsInput,
+            __doc__=JoboHiringSignalsInput.__doc__,
+            limit=(
+                Annotated[int, _SchemaMaximum(max_signals)],
+                Field(
+                    default=min(DEFAULT_SIGNAL_LIMIT, max_signals),
+                    ge=1,
+                    description=_signal_limit_description(max_signals),
+                ),
+            ),
+        )
+        _capped_signal_schemas[max_signals] = schema
+    return schema
+
+
+def _is_stock_signals_schema(schema: object) -> bool:
+    """Whether `schema` is `JoboHiringSignalsInput` or one of its capped copies."""
+    capped = _capped_signal_schemas.values()
+    return schema is JoboHiringSignalsInput or schema in capped
+
+
+class JoboHiringSignalsTool(_JoboTool):
+    """Read hiring signals: events at companies, detected from their job postings.
+
+    A signal is one event at one company: a hiring surge, a first job in a
+    country, a leadership search, a new technology, a slowdown. The tool calls
+    `GET /api/signals`, or `GET /api/companies/{id}/signals` when the model
+    names one company, and gives each signal's company, type, a one-line
+    summary, strength and the ids of up to five jobs behind it, which
+    `JoboJobDetailsTool` reads for free.
+
+    Every signal returned is billed, at ten times the price of a job, and a
+    signal read again is billed again. The tool asks for 5 signals by default
+    and never for more than `max_signals` in one call. It never pages on its
+    own: it hands the model the cursor of the next page instead.
+
+    `get_jobo_tools` leaves it out unless `include_hiring_signals=True`.
+
+    Instantiate:
+        ```python
+        from langchain_jobo import JoboHiringSignalsTool
+
+        tool = JoboHiringSignalsTool(max_signals=10)
+        ```
+
+    Invoke:
+        ```python
+        tool.invoke(
+            {
+                "types": ["function_surge", "new_function"],
+                "functions": ["Sales"],
+                "countries": ["DE"],
+                "industries": ["Financial Services"],
+                "detected_after": "2026-11-01",
+            }
+        )
+        ```
+    """
+
+    name: str = "jobo_hiring_signals"
+    description: str = (
+        "Read hiring signals: events at companies detected from their job "
+        "postings, such as a hiring surge, a first job in a new country or "
+        "function, a leadership search, a new technology, a slowdown or a "
+        "hiring freeze. Use it to find companies that are growing, entering a "
+        "market or building a team, or to check whether one company is hiring "
+        "or freezing. Filter by signal type; by company (domains, or company_id "
+        "for one company); by the companies' country, size, industry and "
+        "funding; and by what the signal is about (functions, roles, seniority, "
+        "technologies, skills, job_countries). Returns each signal's company, "
+        "type, a one-line summary, the day it was detected, its strength and "
+        "the ids of the jobs behind it, which jobo_job_details reads for free. "
+        "Every signal returned is billed, at ten times the price of a job, and "
+        "a signal read again is billed again: keep limit small and do not "
+        "repeat a call you already have the answer to. A call that returns no "
+        "signals costs nothing."
+    )
+    args_schema: type[BaseModel] = JoboHiringSignalsInput
+
+    max_signals: int = Field(
+        default=DEFAULT_MAX_SIGNALS,
+        ge=1,
+        le=SIGNAL_MAX_LIMIT,
+        description=(
+            "Hard cap on signals requested per call. A larger limit from the "
+            "model is reduced to this."
+        ),
+    )
+
+    def __init__(
+        self,
+        *,
+        api_key: SecretStr | str | None = None,
+        max_signals: int | None = None,
+        base_url: str | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
+        http_client: httpx.Client | None = None,
+        http_async_client: httpx.AsyncClient | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Create the hiring signals tool.
+
+        Args:
+            api_key: Jobo API key. Read from the `JOBO_API_KEY` environment
+                variable when not passed. Hiring signals need a live account
+                key: a sandbox key gets a note telling the model to stop.
+            max_signals: Hard cap on signals requested per call, 1-200.
+                Defaults to 25. A larger `limit` from the model is reduced to
+                it, and the tool's schema states it as the maximum.
+            base_url: API base URL. Defaults to `https://connect.jobo.world`.
+            timeout: Response timeout in seconds. Defaults to 30.
+            max_retries: Retries after the first attempt, for 429 responses,
+                503 responses with `Retry-After` and failures to connect. A
+                500, a read timeout or a dropped connection is not retried:
+                the signals may have been billed before it. Defaults to 2.
+            http_client: Optional `httpx.Client` to send sync requests with.
+            http_async_client: Optional `httpx.AsyncClient` for async requests.
+            **kwargs: Other fields of LangChain's `BaseTool`, e.g.
+                `handle_tool_error`, `tags` or `metadata`. An unknown name is
+                rejected.
+
+        Raises:
+            JoboConfigurationError: No API key was passed or found.
+        """
+        super().__init__(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            http_client=http_client,
+            http_async_client=http_async_client,
+            **given(max_signals=max_signals),
+            **kwargs,
+        )
+
+    @model_validator(mode="after")
+    def _state_the_cap_in_the_schema(self) -> JoboHiringSignalsTool:
+        # Also when the tool is rebuilt from another one's fields with a new
+        # cap, as `configurable_fields` does: the schema follows the cap.
+        if _is_stock_signals_schema(self.args_schema):
+            self.args_schema = signals_input_schema(self.max_signals)
+        return self
+
+    def _prepare(
+        self, kwargs: dict[str, Any]
+    ) -> tuple[str, dict[str, Any], int | None]:
+        args = JoboHiringSignalsInput.model_validate(kwargs)
+        limit = min(args.limit, self.max_signals)
+        capped = limit if limit < args.limit else None
+        path, params = build_signals_request(
+            args.filters(), company_id=args.company_id, limit=limit, cursor=args.cursor
+        )
+        return path, params, capped
+
+    @staticmethod
+    def _finish(response: JoboResponse, capped: int | None) -> _Answer:
+        payload = response.data if isinstance(response.data, dict) else {}
+        usage = response.usage.as_dict()
+        artifact = {
+            "signals": signal_list(payload),
+            "next_cursor": payload.get("next_cursor"),
+            "has_more": payload.get("has_more") is True,
+            "usage": usage,
+        }
+        content = format_signals(
+            payload, usage, details_tool="jobo_job_details", capped_limit=capped
+        )
+        return content, artifact
+
+    @staticmethod
+    def _recover(error: JoboError) -> _Answer:
+        if _refused_by_sandbox(error):
+            return (
+                NO_SIGNALS_IN_SANDBOX,
+                {
+                    "signals": [],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "usage": {},
+                    "unavailable": NOT_AVAILABLE_IN_SANDBOX,
+                },
+            )
+        raise ToolException(signals_error_message(error)) from error
+
+    def _run(
+        self,
+        run_manager: CallbackManagerForToolRun | None = None,
+        **kwargs: Any,
+    ) -> _Answer:
+        path, params, capped = self._prepare(kwargs)
+        try:
+            response = self._api().request("GET", path, params=params)
+        except JoboError as error:
+            return self._recover(error)
+        return self._finish(response, capped)
+
+    async def _arun(
+        self,
+        run_manager: AsyncCallbackManagerForToolRun | None = None,
+        **kwargs: Any,
+    ) -> _Answer:
+        path, params, capped = self._prepare(kwargs)
+        try:
+            response = await self._api().arequest("GET", path, params=params)
+        except JoboError as error:
+            return self._recover(error)
+        return self._finish(response, capped)
+
+
 __all__ = [
     "DEFAULT_MAX_PAGE_SIZE",
+    "DEFAULT_MAX_SIGNALS",
+    "DEFAULT_SIGNAL_LIMIT",
     "JoboCompanySearchInput",
     "JoboCompanySearchTool",
     "JoboFilterValuesInput",
     "JoboFilterValuesTool",
+    "JoboHiringSignalsInput",
+    "JoboHiringSignalsTool",
     "JoboJobDetailsInput",
     "JoboJobDetailsTool",
     "JoboLocationSearchInput",
     "JoboLocationSearchTool",
     "JoboSearchTool",
+    "signals_input_schema",
 ]

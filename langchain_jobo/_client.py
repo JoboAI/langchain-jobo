@@ -10,8 +10,8 @@ Internal. It owns the things every component needs to get right:
   are kept and reused, and closed by `close()` / `aclose()`;
 - retries: only `429`, `500` and `503` (and failures to connect) are retried,
   `Retry-After` is honoured, and `402` / `409` are never retried. A `503`
-  without `Retry-After` is not retried, and neither is a `500` on the billed
-  search;
+  without `Retry-After` is not retried, and neither is a `500` on a billed
+  read (search and hiring signals);
 - errors: every non-2xx response is raised as a typed `JoboAPIError`.
 """
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -71,12 +72,14 @@ MISSING_KEY_MESSAGE = (
 )
 
 _RETRYABLE_STATUSES = frozenset({429, 500, 503})
-#: `POST /api/jobs/search` bills every job it returns, every time, and takes
-#: the charge before it builds the response: a `500` can follow a charge, and
-#: a replay would charge again. Only a refusal that comes before any work is
-#: retried there.
+#: `POST /api/jobs/search` bills every job it returns, and the hiring signals
+#: reads every signal, every time. Both take the charge before they build the
+#: response: a `500` can follow a charge, and a replay would charge again. Only
+#: a refusal that comes before any work is retried there.
 _BILLED_RETRYABLE_STATUSES = frozenset({429, 503})
 _BILLED_SEARCH_PATH = "/api/jobs/search"
+#: `GET /api/signals` and `GET /api/companies/{id}/signals`.
+_BILLED_SIGNALS_PATH = re.compile(r"/api/signals|/api/companies/[^/]+/signals")
 _BACKOFF_CAP_SECONDS = 30.0
 
 
@@ -431,8 +434,11 @@ def _transport_failure(exc: httpx.TransportError) -> _AttemptError:
 
 
 def _is_billed(method: str, path: str) -> bool:
-    """Whether the request is a search, which bills every job it returns."""
-    return method.upper() == "POST" and path == _BILLED_SEARCH_PATH
+    """Whether the request bills what it returns: a search, or hiring signals."""
+    verb = method.upper()
+    if verb == "POST":
+        return path == _BILLED_SEARCH_PATH
+    return verb == "GET" and _BILLED_SIGNALS_PATH.fullmatch(path) is not None
 
 
 def _is_retryable(error: JoboAPIError, *, billed: bool) -> bool:

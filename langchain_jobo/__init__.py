@@ -52,10 +52,13 @@ from langchain_jobo.filters import (
     WorkModel,
 )
 from langchain_jobo.retrievers import JoboRetriever
+from langchain_jobo.signals import SignalSeniority, SignalType
 from langchain_jobo.toolkit import get_jobo_tools
 from langchain_jobo.tools import (
     JoboCompanySearchTool,
     JoboFilterValuesTool,
+    JoboHiringSignalsInput,
+    JoboHiringSignalsTool,
     JoboJobDetailsTool,
     JoboLocationSearchTool,
     JoboSearchTool,
@@ -91,6 +94,8 @@ __all__ = [
     "JoboFeedFiltersDict",
     "JoboFeedLoader",
     "JoboFilterValuesTool",
+    "JoboHiringSignalsInput",
+    "JoboHiringSignalsTool",
     "JoboInsufficientCreditsError",
     "JoboJobDetailsTool",
     "JoboLocationSearchTool",
@@ -105,6 +110,8 @@ __all__ = [
     "JoboServerError",
     "JoboValidationError",
     "SearchSort",
+    "SignalSeniority",
+    "SignalType",
     "WorkModel",
     "__version__",
     "aiter_expired_job_ids",

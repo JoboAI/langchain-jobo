@@ -419,12 +419,86 @@ def test_503_with_retry_after_on_the_billed_search_is_retried() -> None:
     assert api.bodies == [{"page_size": 5}] * 2
 
 
+SIGNALS_PATHS = [
+    "/api/signals",
+    "/api/companies/6c1f0a9e-3b7d-4c55-8e21-5a4d9f0b7c33/signals",
+]
+
+
+@pytest.mark.parametrize("path", SIGNALS_PATHS)
+def test_500_on_hiring_signals_is_not_replayed(path: str) -> None:
+    """Signals are billed before the answer is built: a replay bills twice."""
+    client, api, sleeps = build(reply(500, {"message": "An error occurred"}))
+
+    with pytest.raises(JoboServerError):
+        client.request("GET", path, params={"limit": 5})
+
+    assert len(api.requests) == 1
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("path", SIGNALS_PATHS)
+def test_hiring_signals_retry_only_a_refusal_that_came_before_the_charge(
+    path: str,
+) -> None:
+    limited = reply(429, RATE_LIMITED, headers={"Retry-After": "2"})
+    busy = reply(503, {"title": "Unavailable"}, headers={"Retry-After": "5"})
+    client, api, sleeps = build(sequence(limited, busy, ok))
+
+    response = client.request("GET", path, params={"limit": 5})
+
+    assert response.data == {"ok": True}
+    assert sleeps == [2.0, 5.0]
+    assert len(api.requests) == 3
+
+
+@pytest.mark.parametrize("path", SIGNALS_PATHS)
+@pytest.mark.parametrize("error", [httpx.ReadTimeout, httpx.RemoteProtocolError])
+def test_a_lost_hiring_signals_response_is_not_replayed(
+    path: str, error: type[httpx.TransportError]
+) -> None:
+    """The page may have been delivered and billed before the connection broke."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error("the response was lost", request=request)
+
+    client, api, sleeps = build(handler)
+
+    with pytest.raises(JoboConnectionError, match=error.__name__):
+        client.request("GET", path)
+
+    assert len(api.requests) == 1
+    assert sleeps == []
+
+
+def test_a_500_on_another_company_path_is_still_retried() -> None:
+    """Only the signals reads are billed; a company's jobs list is not."""
+    client, api, sleeps = build(reply(500, {"message": "boom"}))
+
+    with pytest.raises(JoboServerError):
+        client.request("GET", "/api/companies/6c1f0a9e/jobs")
+
+    assert len(api.requests) == 3
+    assert sleeps == [1.0, 2.0]
+
+
+async def test_async_hiring_signals_are_not_replayed_after_a_500() -> None:
+    client, api, sleeps = build(reply(500, {"message": "boom"}))
+
+    with pytest.raises(JoboServerError):
+        await client.arequest("GET", "/api/signals", params={"types": "hiring_surge"})
+
+    assert len(api.requests) == 1
+    assert sleeps == []
+
+
 @pytest.mark.parametrize(
     ("method", "path"),
     [
         ("POST", "/api/jobs/search"),
         ("POST", "/api/jobs/feed"),
         ("GET", "/api/jobs/x"),
+        ("GET", "/api/signals"),
     ],
 )
 def test_503_without_retry_after_is_not_retried(method: str, path: str) -> None:

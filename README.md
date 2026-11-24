@@ -11,10 +11,11 @@ loader.
 | `JoboCompanySearchTool` (`jobo_company_search`) | Company name or domain to company ids | `GET /api/connectors/companies/suggest` | Free |
 | `JoboFilterValuesTool` (`jobo_filter_values`) | The values a filter accepts, with job counts | `GET /api/connectors/filter-options/{facet}`, `GET /api/occupations` | Free |
 | `JoboLocationSearchTool` (`jobo_location_search`) | A place name to the locations the search takes | `GET /api/connectors/locations/suggest` | Free |
+| `JoboHiringSignalsTool` (`jobo_hiring_signals`) | Hiring signals: events at companies, such as a hiring surge or a first job in a country | `GET /api/signals`, `GET /api/companies/{id}/signals` | Per signal returned, at ten times a job |
 | `JoboRetriever` | Query to job `Document`s | `POST /api/jobs/search` | Per job returned |
 | `JoboFeedLoader` | Stream the job feed as `Document`s, and list closed jobs | `POST /api/jobs/feed`, `GET /api/jobs/expired` | Per new job; closed-job ids are free |
 | `iter_expired_job_ids()` | The ids of closed jobs, without a loader | `GET /api/jobs/expired` | Free |
-| `get_jobo_tools()` | The five tools in one call | | |
+| `get_jobo_tools()` | The five job tools in one call, and the hiring signals tool when you ask for it | | |
 
 Read [Cost](#cost) before pointing an agent at it.
 
@@ -51,6 +52,7 @@ serves job search and job lookups, and nothing else this package calls:
 | --- | --- |
 | `JoboSearchTool`, `JoboJobDetailsTool`, `JoboRetriever` | Work |
 | `JoboCompanySearchTool`, `JoboFilterValuesTool`, `JoboLocationSearchTool` | The sandbox answers `404 not_available_in_sandbox`. The tool does not raise: it tells the model the lookup is unavailable and what to do instead, so an agent run carries on |
+| `JoboHiringSignalsTool` | The sandbox answers `404 not_available_in_sandbox`. The tool does not raise: it tells the model that hiring signals need a live key and not to call it again |
 | `JoboFeedLoader`, `iter_expired_job_ids()` | Refused when it is built or called, with `JoboConfigurationError` |
 
 So `get_jobo_tools()` is safe to use with a sandbox key. `get_jobo_tools(include_lookups=False)` leaves the
@@ -206,6 +208,89 @@ Returns matching cities, regions and countries, written the way the `location` f
 search resolves a free-form location by itself, so this is for an ambiguous name, or for a search that
 reports a location it could not resolve.
 
+### `JoboHiringSignalsTool`
+
+A hiring signal is one event at one company, detected from its job postings: a hiring surge, a first job
+in a new country or function, a leadership search, a new technology, a slowdown or a hiring freeze. This is
+the tool for a sales, recruiting or investor research agent: "which fintechs in Germany started hiring a
+sales team this month?", "is acme.com growing or freezing?". See the
+[hiring signals guide](https://jobo.world/docs/guides/hiring-signals) for the types and filters.
+
+```python
+from langchain_jobo import JoboHiringSignalsTool
+
+signals = JoboHiringSignalsTool(max_signals=10)
+
+print(
+    signals.invoke(
+        {
+            "types": ["function_surge", "new_function"],
+            "functions": ["Sales"],
+            "countries": ["DE"],
+            "industries": ["Financial Services"],
+            "detected_after": "2026-11-01",
+        }
+    )
+)
+```
+
+```text
+1 hiring signal, newest detection day first. No more match.
+
+1. Ledgerly (ledgerly.example) - Function surge
+   12 new Sales jobs in 14 days vs 2.5 normally
+   Detected: 2026-11-18 | Strength: Strong (71/100)
+   Company ID: 6c1f0a9e-3b7d-4c55-8e21-5a4d9f0b7c33
+   Evidence jobs: a41c7e02-58b1-4d0f-b6c9-0e2f7d5a1c88, 0b9e6a37-2c4d-4f1e-8a5b-9d3c7e1f2a46
+
+Evidence jobs are the postings behind a signal: read one free with jobo_job_details.
+
+Billed: 1 hiring signal (0 of 250 included signals left this month; 30 credits charged to the wallet; wallet balance 4,970 credits). Reading the same signals again is billed again.
+```
+
+Each signal comes with its company and domain, its type, the one-line summary Jobo's dashboard shows for
+it, the day it was detected, its strength (1 to 100, comparable within one type) as a band and a number,
+and the ids of up to five jobs behind it, which `jobo_job_details` reads for free. The last line says what
+the call was billed, from the response's metering headers. A type added to the API after this release is
+shown by its name, never an error. Called with a `ToolCall`, the artifact holds `signals` (the raw signal
+objects, `details` and `focus` included), `next_cursor`, `has_more` and `usage`.
+
+Arguments: `types`, `domains`, `company_id`, `countries`, `company_sizes`, `industries`, `funding_stages`,
+`functions`, `roles`, `seniority`, `technologies`, `skills`, `job_countries`, `min_strength`,
+`detected_after`, `detected_before`, `created_after`, `exclude_agencies`, `limit` and `cursor`.
+
+- **Filters combine with AND**; the values of one list match any of them. `types`, `seniority` and
+  `company_sizes` are closed sets, checked before any request.
+- **A value cannot contain a comma.** The API separates list values with commas, so a value with one is
+  refused before the request instead of being read as two. A single string is split on commas for codes
+  (`domains`, `countries`, `technologies`, `skills`, ...) and kept whole for names (`industries`,
+  `funding_stages`, `functions`, `roles`). A list takes at most 100 values.
+- **`company_id`** reads one company from `GET /api/companies/{id}/signals`, which takes only `types`,
+  `min_strength`, `detected_after`, `detected_before` and `created_after`. Any other filter beside it is
+  refused with a message that names it, because that endpoint would ignore it. To name companies by
+  website, use `domains`.
+- **`limit`** defaults to 5. The tool never asks for more than `max_signals` (default 25, at most 200, the
+  API's own limit), and a larger number is reduced to it with a note in the answer.
+- **One call is one request.** The tool never pages on its own: when more signals match, the answer gives
+  the model the `cursor` to ask for the next page.
+
+The other filters of the API (`exclude_domains`, `categories`, `founded_after`, `technology_categories`,
+`job_regions`, `job_cities`, `min_new_jobs`, `min_days_open`, `reposted_only`) are left off the tool.
+`langchain_jobo.signals.build_signals_request()` takes them all, for your own code.
+
+The tool is not in `get_jobo_tools()` unless you ask for it: every signal it returns is billed at ten times
+the price of a job, and a signal read again is billed again.
+
+```python
+from langchain_jobo import get_jobo_tools
+
+tools = get_jobo_tools(include_hiring_signals=True, max_signals=10)
+```
+
+Hiring signals need a live account API key: a key that belongs to no account gets `403
+account_key_required`, and the tool tells the model to stop. `langchain_jobo.signals.describe_signal()`
+writes the one-line summary for a signal you hold.
+
 ### All five at once
 
 ```python
@@ -219,6 +304,8 @@ tools = get_jobo_tools(max_page_size=10)
 | `api_key` | `JOBO_API_KEY` | The only one that can also be passed by position |
 | `max_page_size` | 25 | Cap on jobs the search tool requests per call |
 | `include_lookups` | `True` | `False` returns the search and details tools only |
+| `include_hiring_signals` | `False` | `True` adds `JoboHiringSignalsTool`, last. Billed per signal at ten times a job |
+| `max_signals` | 25 | Cap on signals the hiring signals tool requests per call, at most 200 |
 | `handle_tool_error` | `False` | Hand API errors to the model instead of raising (see [Agent](#agent)) |
 | `handle_validation_error` | `False` | The same for arguments the model got wrong |
 | `base_url`, `timeout`, `max_retries`, `http_client`, `http_async_client` | | As in [Configuration](#configuration), applied to every tool |
@@ -447,7 +534,8 @@ The package is typed (`py.typed`) and its documented calls pass `mypy --strict` 
   `CompanyCategoryFilterDict`, `CompanySizeFilterDict` and `CompanyRevenueFilterDict`), so an editor
   completes the keys and values of `filters={...}` and a type checker catches a misspelt one.
 - **Fixed value sets are `Literal` aliases**: `WorkModel`, `EmploymentType`, `ExperienceLevel`,
-  `CompanyCategory`, `CompanySize`, `CompanyRevenue`, `SearchSort`, `DescriptionFormat` and `FilterFacet`.
+  `CompanyCategory`, `CompanySize`, `CompanyRevenue`, `SearchSort`, `DescriptionFormat`, `FilterFacet`,
+  and for hiring signals `SignalType` and `SignalSeniority`.
 - Everything above is importable from `langchain_jobo`.
 
 ```python
@@ -477,6 +565,10 @@ Jobo bills per job, not per request. These figures are from the
   last 30 days. A job you already received is delivered again at no charge.
 - A Job Search plan's included jobs are used first, then the prepaid wallet at the pay-as-you-go rate of
   $3.00 per 1,000 jobs. The Unlimited plan has no per-job charge on Search or Feed.
+- **Hiring signals** (`JoboHiringSignalsTool`) bill every signal a response returns, at ten times the price
+  of a job, and a signal read again is billed again. A plan's included signals are used first, then the
+  wallet; the Unlimited plan has no per-signal charge. A request that returns no signals is free. See the
+  [hiring signals guide](https://jobo.world/docs/guides/hiring-signals#pricing).
 - `GET /api/jobs/{id}` (`JoboJobDetailsTool`) is free, and so are the company, filter-value and location
   lookups and the expired-job ids. They still count toward rate limits.
 - Before a billed request runs, the API checks that included jobs plus the wallet cover a *full* page
@@ -486,11 +578,14 @@ Jobo bills per job, not per request. These figures are from the
 What this package does about it:
 
 - The search tool asks for 5 jobs by default and caps every call at `max_page_size`.
+- The hiring signals tool is only in `get_jobo_tools()` with `include_hiring_signals=True`. It asks for 5
+  signals by default, caps every call at `max_signals`, never pages on its own, and ends every answer with
+  what the call was billed.
 - The retriever returns `k` jobs (default 5).
 - The feed loader will not run without an explicit `max_jobs`.
-- `402` is never retried. Neither is a read timeout, nor a `500` on search: a page may already have been
-  delivered and billed.
-- Search tool artifacts carry the `usage` the API reported for the call.
+- `402` is never retried. Neither is a read timeout, nor a `500` on search or hiring signals: a page may
+  already have been delivered and billed.
+- Search and hiring signals tool artifacts carry the `usage` the API reported for the call.
 
 An agent that searches in a loop spends per job returned on every call, so keep `max_page_size` low and
 say in your prompt when to stop searching.
@@ -507,10 +602,14 @@ Neither are:
 
 - a `503` without `Retry-After`. The API sends one when a search ran out of time ("Search took too long"),
   which fails the same way again;
-- a `500` on search (`JoboSearchTool`, `JoboRetriever`). Search takes its charge before it builds the
-  response, so a `500` can follow a charge and a replay would bill the jobs again. Search retries only `429`
-  and a `503` with `Retry-After`, which come before any work. A feed request is safe to replay, because a
-  job delivered again is free.
+- a `500` on search (`JoboSearchTool`, `JoboRetriever`) or on hiring signals (`JoboHiringSignalsTool`).
+  Both take their charge before they build the response, so a `500` can follow a charge and a replay would
+  bill again. They retry only `429` and a `503` with `Retry-After`, which come before any work. A feed
+  request is safe to replay, because a job delivered again is free.
+
+The hiring signals tool adds what the model can do to the message of a `402` (ask for a smaller `limit`),
+a `403` (stop: `account_key_required` means the key belongs to no account), a `429` (wait) and a `400`
+(correct the arguments).
 
 | Exception | Status | Notes |
 | --- | --- | --- |

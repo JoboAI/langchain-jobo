@@ -21,6 +21,7 @@ from langchain_tests.unit_tests import ToolsUnitTests
 from langchain_jobo import (
     JoboCompanySearchTool,
     JoboFilterValuesTool,
+    JoboHiringSignalsTool,
     JoboJobDetailsTool,
     JoboLocationSearchTool,
     JoboRetriever,
@@ -67,11 +68,28 @@ PLACES = {
     ]
 }
 
+SIGNALS = {
+    "signals": [
+        {
+            "id": "0d0f5c1e-7a52-4f0e-9d3b-2f6f1c7a9b10",
+            "type": "new_country",
+            "detected_on": "2026-11-10",
+            "strength": 64,
+            "company": {"id": "id-1", "name": "Stripe", "domain": "stripe.com"},
+            "details": {"country": "Germany", "new_jobs": 3},
+            "evidence_job_ids": ["00000000-0000-4000-8000-000000000001"],
+        }
+    ],
+    "has_more": False,
+}
+
 
 def _handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     if path == "/api/jobs/search":
         return search_handler(request)
+    if path == "/api/signals":
+        return httpx.Response(200, json=SIGNALS, headers={"X-Credits-Deducted": "30"})
     if path == "/api/connectors/companies/suggest":
         return httpx.Response(200, json=SUGGESTIONS)
     if path == "/api/connectors/locations/suggest":
@@ -250,6 +268,38 @@ class TestJoboLocationSearchToolMocked(ToolsIntegrationTests):
     @property
     def tool_invoke_params_example(self) -> dict[str, Any]:
         return {"query": "berlin", "limit": 3}
+
+
+class TestJoboHiringSignalsToolUnit(ToolsUnitTests):
+    @property
+    def tool_constructor(self) -> type[BaseTool]:
+        return JoboHiringSignalsTool
+
+    @property
+    def tool_constructor_params(self) -> dict[str, Any]:
+        return {"api_key": TEST_KEY}
+
+    @property
+    def tool_invoke_params_example(self) -> dict[str, Any]:
+        return {"types": ["new_country"], "domains": ["stripe.com"], "limit": 3}
+
+    @property
+    def init_from_env_params(self) -> EnvParams:
+        return ENV_PARAMS
+
+
+class TestJoboHiringSignalsToolMocked(ToolsIntegrationTests):
+    @property
+    def tool_constructor(self) -> type[BaseTool]:
+        return JoboHiringSignalsTool
+
+    @property
+    def tool_constructor_params(self) -> dict[str, Any]:
+        return _mocked()
+
+    @property
+    def tool_invoke_params_example(self) -> dict[str, Any]:
+        return {"types": ["new_country"], "domains": ["stripe.com"], "limit": 3}
 
 
 class TestJoboRetrieverMocked(RetrieversIntegrationTests):

@@ -8,6 +8,8 @@ COMPONENTS = [
     "JoboCompanySearchTool",
     "JoboFeedLoader",
     "JoboFilterValuesTool",
+    "JoboHiringSignalsInput",
+    "JoboHiringSignalsTool",
     "JoboJobDetailsTool",
     "JoboLocationSearchTool",
     "JoboRetriever",
@@ -66,6 +68,8 @@ LITERALS = [
     "ExperienceLevel",
     "FilterFacet",
     "SearchSort",
+    "SignalSeniority",
+    "SignalType",
     "WorkModel",
 ]
 
@@ -96,4 +100,4 @@ def test_every_filter_model_has_a_dict_spelling() -> None:
 
 
 def test_version_is_a_release_string() -> None:
-    assert langchain_jobo.__version__ == "0.1.1"
+    assert langchain_jobo.__version__ == "0.2.0"
